@@ -9,44 +9,6 @@ import numpy.typing as npt
 from scipy import sparse
 from .mesh import Mesh
 
-# Kprime_submatrix = np.array([
-#     [4, -1, -2, -1],
-#     [-1, 4, -1, -2],
-#     [-2, -1, 4, -1],
-#     [-1, -2, -1, 4]
-# ], dtype=np.float)
-
-# class SubmatrixData:
-
-#     def __init__(self, kappa, connectivity):
-#         self.Kprime_submatrix = np.array([
-#             [4, -1, -2, -1],
-#             [-1, 4, -1, -2],
-#             [-2, -1, 4, -1],
-#             [-1, -2, -1, 4]
-#         ], dtype=float)
-#         self.kappa = kappa
-#         self.connectivity = connectivity
-
-#     """ I'll need to change this to handle B.Cs. Probably get rid of this class. """
-#     def __getitem__(self, index):
-#         Ki = index//self.Kprime_submatrix.size
-#         j = index % self.Kprime_submatrix.size
-#         return self.Kprime_matrix.flatten()[Ki]*self.kappa[j]
-
-#     def __len__(self,index):
-#         return self.Kprime_submatrix.size*self.kappa.size
-
-#     def get_ij(self):
-#         i = np.expand_dims(self.connectivity, axis = 0)
-#         i = np.tile(i, (4, 1, 1))
-#         i = i.flatten()
-#         j = np.expand_dims(self.connectivity, axis=1)
-#         j = np.tile(j, (1, 4, 1))
-#         j = j.flatten()
-#         return i, j
-
-
 class FEMProblem:
     """
     if apply_dirichlet_on == "boundary", take all boundary nodes to be dirichlet
@@ -120,7 +82,8 @@ class FEMProblem:
         # cut out boundary nodes
         u_d = u_d * self.dirichlet_nodes_bool
         f_prob = f.copy() - K @ u_d
-        K = K[self.active_nodes_bool, self.active_nodes_bool]
+        K = K[self.active_nodes_bool,:]
+        K = K[:,self.active_nodes_bool]
         f_prob = f_prob[self.active_nodes_bool]
         return K, f_prob
 
@@ -152,8 +115,8 @@ class FEMProblem:
         w, info2 = sparse.linalg.lgmres(K.T, u0 - u_kappa, rtol=self.rtol)
         # Add back boundary nodes
         u_kappa_ = np.zeros_like(u_d)
-        u_kappa_[self.dirichlet_nodes_bool] = u_d[self.dirichlet_nodes_bool]
         u_kappa_[self.active_nodes_bool] = u_kappa
+        u_kappa_[self.dirichlet_nodes_bool] = u_d[self.dirichlet_nodes_bool]
         u_kappa = u_kappa_
         w_ = np.zeros_like(u_d)
         w_[self.active_nodes_bool] = w
@@ -165,7 +128,7 @@ class FEMProblem:
                 "i,ij,j", u_kappa[n], self.Kprime_submatrix, w[n]
             )
         del K, w, w_
-        return u_kappa_, dJ
+        return u_kappa, dJ
 
     """
     A forward problem
@@ -203,7 +166,7 @@ def verify_gradient(
     dirs = None,
 ) -> np.float64 | npt.NDArray[np.float64]:
     u_kappa, dJ = fem_problem.inverse_step(kappa, u0)
-    J0 = np.sum((u_kappa - u0) ** 2)
+    J0 = 0.5*np.sum((u_kappa - u0) ** 2)
     if dirs == None:
         # chose 10 random unissst directions
         dirs = np.random.randn(10, kappa.size)
@@ -214,11 +177,13 @@ def verify_gradient(
             d_errs = []
             for dir in dirs:
                 u_kappa_d = fem_problem.forward(kappa + e * dir)
-                Jd = np.sum((u_kappa_d - u0) ** 2)
+                Jd = 0.5*np.sum((u_kappa_d - u0) ** 2)
                 print(Jd)
                 fd_dir_grad = (Jd - J0) / e
+                print('fd:', fd_dir_grad)
+                print('dJ:', np.dot(dJ, dir))
                 d_errs.append(fd_dir_grad - np.dot(dJ, dir))
-            err_list.append(np.mean(np.array(d_errs) ** 2))
+            err_list.append(np.sqrt(np.mean(np.array(d_errs) ** 2)))
         return dJ, np.array(err_list)
     else:
         d_errs = []
@@ -227,24 +192,22 @@ def verify_gradient(
             Jd = np.sum((u_kappa_d - u0) ** 2)
             fd_dir_grad = (Jd - J0) / epsilon
             d_errs.append(fd_dir_grad - np.dot(dJ, dir))
-        return dJ, np.mean(np.array(d_errs) ** 2)
+        return dJ, np.sqrt(np.mean(np.array(d_errs) ** 2))
 
+#   Test gradient with zero BCs and forcing
+def test_gradient_1():
+    import matplotlib.pyplot as plt
+    fem_problem = FEMProblem(64, rtol=1e-9)
 
-if __name__ == "__main__":
-    fem_problem = FEMProblem(64)
-    # define boundary condition
-    u_d = fem_problem.mesh.coordinates[0, :]
-    # make a conductivity field
+    u_d = np.zeros(fem_problem.num_nodes)
+    node_coords = fem_problem.mesh.coordinates
+    f = node_coords[0, :]**2 + node_coords[1, :]**2
     elem_coords = fem_problem.mesh.get_element_coordinates(
         np.arange(fem_problem.mesh.num_elements)[:]
     )
     y_vals = np.mean(np.array(elem_coords)[0, :, :], axis=0)
     kappa = 1 + 100 * y_vals
-
-    f = np.zeros_like(u_d)
-
     fem_problem.set_parameters(f, u_d)
-
     u_true = fem_problem.forward(kappa)
     fem_problem.mesh.plot(u_true)
 
@@ -256,6 +219,81 @@ if __name__ == "__main__":
     dJ, errors = verify_gradient(fem_problem, kappa, u0, epsilon_list)
     errors = errors/np.linalg.norm(dJ)
 
+    print(errors)
+    print(np.linalg.norm(dJ))
+    # log_epsilon_list =  np.log(epsilon_list)
+    plt.figure()
+    plt.plot(epsilon_list, errors)
+    plt.xlabel(r'$\epsilon$')
+    plt.ylabel(r'E')
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.tight_layout()
+    plt.xlim([epsilon_list[-1], epsilon_list[0]])
+    plt.show()
+
+# Test gradient with zero forcing and nonzero BCs
+def test_gradient_2():
+    import matplotlib.pyplot as plt
+    fem_problem = FEMProblem(128)
+    # define boundary condition
+    u_d = fem_problem.mesh.coordinates[0, :]
+    # make a conductivity field
+    elem_coords = fem_problem.mesh.get_element_coordinates(
+        np.arange(fem_problem.mesh.num_elements)[:]
+    )
+    y_vals = np.mean(np.array(elem_coords)[0, :, :], axis=0)
+    kappa = 1 + 100 * y_vals
+    f = np.zeros_like(u_d)
+    fem_problem.set_parameters(f, u_d)
+
+    u_true = fem_problem.forward(kappa)
+    fem_problem.mesh.plot(u_true)
+
+    # test gradient
+    u0 = u_true + 0.1 * np.random.randn(u_true.size)
+    u0[fem_problem.dirichlet_nodes] = u_d[fem_problem.dirichlet_nodes]
+    kappa_noise = np.random.randn(kappa.size)
+    kappa = kappa + 0.5 * kappa_noise/np.linalg.norm(kappa_noise)
+    epsilon_list = np.array([1, 0.1, 0.01, 0.001, 0.0001, 0.00001])
+    dJ, errors = verify_gradient(fem_problem, kappa, u0, epsilon_list)
+    print(errors)
+    errors = errors/np.linalg.norm(dJ)
+
+    print(errors)
+    print(np.linalg.norm(dJ))
+    # log_epsilon_list =  np.log(epsilon_list)
+    plt.figure()
+    plt.plot(epsilon_list, errors)
+    plt.xlabel(r'$\epsilon$')
+    plt.ylabel(r'E')
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.tight_layout()
+    plt.xlim([epsilon_list[-1], epsilon_list[0]])
+    plt.show()
+
+def example_inverse_problem():
+    pass
+
+if __name__ == "__main__":
+    A = np.array([[1, 2], [3, 4]])
+    z = np.array([True, False])
+    print(A*z)
+    print(z*A)
+    # test_gradient_1()
+    test_gradient_2()
+
+    # fem_problem.mesh.plot(u_true)
+
+    # test gradient
+    # u0 = u_true + 0.1 * np.random.randn(u_true.size)
+    # kappa_noise = np.random.randn(kappa.size)
+    # kappa = kappa + 0.5 * kappa_noise/np.linalg.norm(kappa_noise)
+    # epsilon_list = np.array([1, 0.1, 0.01, 0.001, 0.0001, 0.00001])
+    # dJ, errors = verify_gradient(fem_problem, kappa, u0, epsilon_list)
+    # errors = errors/np.linalg.norm(dJ)
+
     # print(errors)
     # import matplotlib.pyplot as plt
 
@@ -264,25 +302,27 @@ if __name__ == "__main__":
     # plt.show()
     
     # solve for kappa
-    rate = 0.1
-    kappa_est = np.ones(fem_problem.mesh.num_elements)
-    kappa_conv = []
-    J_conv = []
-    for i in range(200):
-        print('iteration', i)
-        u_kappa, dJ = fem_problem.inverse_step(kappa_est, u_true)
+    # rate = 0.1
+    # kappa_est = np.ones(fem_problem.mesh.num_elements)
+    # kappa_conv = []
+    # J_conv = []
+    # for i in range(200):
+    #     print('iteration', i)
+    #     u_kappa, dJ = fem_problem.inverse_step(kappa_est, u_true)
         
-        J = np.sum((u_true - u_kappa)**2)
-        J_conv.append(J)
-        kappa_err = np.sum((kappa - kappa_est)**2)
-        kappa_conv.append(kappa_err)
-        kappa_est -= rate*dJ
-    print(kappa_err.shape)
-    fig, (ax1, ax2) = plt.subplots(2, 1)
-    ax1.plot(J_conv)
-    ax2.plot(kappa_conv)
-    plt.show()
-    print(u_d.shape)
+    #     J = np.sum((u_true - u_kappa)**2)
+    #     J_conv.append(J)
+    #     kappa_err = np.sum((kappa - kappa_est)**2)
+    #     kappa_conv.append(kappa_err)
+    #     kappa_est -= rate*dJ
+    # print(kappa_err.shape)
+    # fig, (ax1, ax2) = plt.subplots(2, 1)
+    # ax1.plot(J_conv)
+    # ax2.plot(kappa_conv)
+    # plt.show()
+    # print(u_d.shape)
+
+
 
     # I, J = fem_problem.I, fem_problem.J
     # Kprime_submatrix = np.array([
@@ -298,16 +338,3 @@ if __name__ == "__main__":
     # dirichlet_nodes = fem_problem.dirichlet_nodes
     # K = K[:,dirichlet_nodes]
     # K = K[dirichlet_nodes,:]
-# dJ = np.zeros_like(kappa)
-# v = np.zeros()
-# for i, u_ in enumerate(u):
-#     v[i:self.elem_connectivity[i]] =
-#     for j, w_ in enumerate(w):
-#         v[]
-#         dJ[]
-#     v[self.elem_connectivity]
-# dJ = v.T@w
-# dJ[i] =
-
-# dJ = np.zeros_like(kappa)
-# += u_*self.submatrix_data.Kprime_submatrix.flatten()
