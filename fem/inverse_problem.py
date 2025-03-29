@@ -21,9 +21,10 @@ class FEMProblem:
     """
 
     def __init__(
-        self, num_pixels: int, f=None, u_d=None, apply_dirichlet_on="boundary", rtol=1e-5
+        self, num_pixels: int, f=None, u_d=None, apply_dirichlet_on="boundary", rtol=1e-5, atol=1e-5
     ):
         print("making mesh...")
+        self.atol = atol
         self.rtol = rtol
         self.f = f
         self.u_d = u_d
@@ -61,7 +62,7 @@ class FEMProblem:
 
     def set_parameters(self, f: npt.NDArray[np.float64], u_d: npt.NDArray[np.float64]):
         self.f = f
-        self.u_d = u_d
+        self.u_d = u_d * self.dirichlet_nodes_bool
         
 
     """
@@ -92,14 +93,16 @@ class FEMProblem:
     
     kappa: conductivity field
     f: forcing field. This includes at boundary nodes
-    u0: current guess of u0.
+    uhat: measured uhat value.
+    u0: initial guess of u
     u_d: vector of the same shape as u; contains boundary values at boundary nodes. It can be zero everywhere else.
     """
 
     def inverse_step(
         self,
         kappa: npt.NDArray[np.float64],
-        u0: npt.NDArray[np.float64],
+        uhat: npt.NDArray[np.float64],
+        u0=None,
         f=None,
         u_d=None,
     ):
@@ -108,11 +111,24 @@ class FEMProblem:
         assert not f is None, "f must be set with set_parameters()"
         assert not u_d is None, "u_d must be set with set_parameters()"
         K, f = self.make_stiffness_and_bcs(kappa, f, u_d)
-        u0 = u0[self.active_nodes_bool]
+        print(K)
+        uhat = uhat[self.active_nodes_bool]
+        if (u0 == None):
+            u0 = uhat
+        else:
+            u0 = u0[self.active_nodes_bool]
         # solve forward problem
-        u_kappa, info1 = sparse.linalg.lgmres(K, f, rtol=self.rtol)
+        u_kappa, info1 = sparse.linalg.lgmres(K, f, x0=u0, rtol=self.rtol, atol=self.atol)
+        if(info1 > 0):
+            print("Result of forward solver did not converge to tolerance")
+        if(info1 < 0):
+            print("Illegal input or breakdown in forward solver.")
         # solve adjoint problem
-        w, info2 = sparse.linalg.lgmres(K.T, u0 - u_kappa, rtol=self.rtol)
+        w, info2 = sparse.linalg.lgmres(K.T, uhat - u_kappa, rtol=self.rtol, atol=self.atol)
+        if (info2 > 0):
+            print("Result of adjoint solver did not converge to tolerance")
+        if(info1 < 0):
+            print("Illegal input or breakdown in adjoint solver.")
         # Add back boundary nodes
         u_kappa_ = np.zeros_like(u_d)
         u_kappa_[self.active_nodes_bool] = u_kappa
@@ -135,10 +151,11 @@ class FEMProblem:
     
     kappa: conductivity field
     f: forcing field. This includes at boundary nodes
+    u0: initial guess of u
     u_d: vector of the same shape as u; contains boundary values at boundary nodes. It can be zero everywhere else.
     """
 
-    def forward(self, kappa: npt.NDArray[np.float64], f=None, u_d=None):
+    def forward(self, kappa: npt.NDArray[np.float64], u0=None, f=None, u_d=None):
         f = f if not f is None else self.f
         u_d = u_d if not u_d is None else self.u_d
         assert not f is None, "f must be set with set_parameters()"
@@ -180,9 +197,10 @@ def verify_gradient(
                 Jd = 0.5*np.sum((u_kappa_d - u0) ** 2)
                 print(Jd)
                 fd_dir_grad = (Jd - J0) / e
+                exact_dir_grad = np.dot(dJ, dir)
                 print('fd:', fd_dir_grad)
-                print('dJ:', np.dot(dJ, dir))
-                d_errs.append(fd_dir_grad - np.dot(dJ, dir))
+                print('dJ:', exact_dir_grad)
+                d_errs.append((fd_dir_grad - exact_dir_grad)/(exact_dir_grad))
             err_list.append(np.sqrt(np.mean(np.array(d_errs) ** 2)))
         return dJ, np.array(err_list)
     else:
@@ -190,8 +208,10 @@ def verify_gradient(
         for dir in dirs:
             u_kappa_d = fem_problem.forward(kappa + epsilon * dir)
             Jd = np.sum((u_kappa_d - u0) ** 2)
-            fd_dir_grad = (Jd - J0) / epsilon
-            d_errs.append(fd_dir_grad - np.dot(dJ, dir))
+            exact_dir_grad = np.dot(dJ, dir)
+            print('fd:', fd_dir_grad)
+            print('dJ:', exact_dir_grad)
+            d_errs.append((fd_dir_grad - exact_dir_grad)/(exact_dir_grad))
         return dJ, np.sqrt(np.mean(np.array(d_errs) ** 2))
 
 #   Test gradient with zero BCs and forcing
@@ -217,9 +237,9 @@ def test_gradient_1():
     kappa = kappa + 0.5 * kappa_noise/np.linalg.norm(kappa_noise)
     epsilon_list = np.array([1, 0.1, 0.01, 0.001, 0.0001, 0.00001])
     dJ, errors = verify_gradient(fem_problem, kappa, u0, epsilon_list)
-    errors = errors/np.linalg.norm(dJ)
+    # errors = errors/np.linalg.norm(dJ)
 
-    print(errors)
+    print('errors:', errors)
     print(np.linalg.norm(dJ))
     # log_epsilon_list =  np.log(epsilon_list)
     plt.figure()
@@ -235,7 +255,7 @@ def test_gradient_1():
 # Test gradient with zero forcing and nonzero BCs
 def test_gradient_2():
     import matplotlib.pyplot as plt
-    fem_problem = FEMProblem(128)
+    fem_problem = FEMProblem(4, rtol=1e-9)
     # define boundary condition
     u_d = fem_problem.mesh.coordinates[0, :]
     # make a conductivity field
@@ -255,12 +275,11 @@ def test_gradient_2():
     u0[fem_problem.dirichlet_nodes] = u_d[fem_problem.dirichlet_nodes]
     kappa_noise = np.random.randn(kappa.size)
     kappa = kappa + 0.5 * kappa_noise/np.linalg.norm(kappa_noise)
-    epsilon_list = np.array([1, 0.1, 0.01, 0.001, 0.0001, 0.00001])
+    epsilon_list = np.array([1, 0.1, 0.01, 0.001, 0.0001, 0.00001, 0.000001])
     dJ, errors = verify_gradient(fem_problem, kappa, u0, epsilon_list)
-    print(errors)
-    errors = errors/np.linalg.norm(dJ)
+    print('errors:', errors)
+    # errors = errors/np.linalg.norm(dJ)
 
-    print(errors)
     print(np.linalg.norm(dJ))
     # log_epsilon_list =  np.log(epsilon_list)
     plt.figure()
@@ -277,12 +296,66 @@ def example_inverse_problem():
     pass
 
 if __name__ == "__main__":
-    A = np.array([[1, 2], [3, 4]])
-    z = np.array([True, False])
-    print(A*z)
-    print(z*A)
-    # test_gradient_1()
-    test_gradient_2()
+    test_gradient_1()
+    # test_gradient_2()
+    np.random.seed(42)
+    fem_problem = FEMProblem(64, rtol=0.0, atol=1e-10)
+    # define boundary condition
+    u_d = fem_problem.mesh.coordinates[0, :]
+    # u_d = np.ones(fem_problem.num_nodes)
+    # u_d[0] = 1.
+    # u_d[1] = 1.
+    # u_d[2] = 1.
+    # u_d[3] = 1.
+    # u_d[4] = 1.
+    # u_d[5] = 1.
+    # u_d[6] = 1.
+    print(fem_problem.mesh.coordinates)
+    # make a conductivity field
+    elem_coords = fem_problem.mesh.get_element_coordinates(
+        np.arange(fem_problem.mesh.num_elements)[:]
+    )
+    y_vals = np.mean(np.array(elem_coords)[0, :, :], axis=0)
+    kappa = (1 + 100 * y_vals)*0.01
+    # kappa = np.ones(fem_problem.num_elements)
+    f = np.zeros_like(u_d)
+    fem_problem.set_parameters(f, u_d)
+
+    kappa_noise = np.random.randn(kappa.size)
+    kappa = kappa + 0.5 * kappa_noise/np.linalg.norm(kappa_noise)
+
+    u_true = fem_problem.forward(kappa)
+    print(u_true)
+    
+    fem_problem.mesh.plot(u_true)
+
+    # test gradient
+    u0 = u_true + 0.1 * np.random.randn(u_true.size)
+    u0[fem_problem.dirichlet_nodes] = u_d[fem_problem.dirichlet_nodes]
+    # kappa_noise = np.random.randn(kappa.size)
+    # kappa = kappa + 0.5 * kappa_noise/np.linalg.norm(kappa_noise)
+    
+    K, f_prob = fem_problem.make_stiffness_and_bcs(kappa, f, u_d)
+    
+    print(K.shape)
+    print(f_prob)
+    
+    epsilon_list = np.array([1, 0.1, 0.01, 0.001, 0.0001, 0.00001, 0.000001])
+    dJ, errors = verify_gradient(fem_problem, kappa, u0, epsilon_list)
+    print('errors:', errors)
+    
+    import matplotlib.pyplot as plt
+    print(np.linalg.norm(dJ))
+    # log_epsilon_list =  np.log(epsilon_list)
+    plt.figure()
+    plt.plot(epsilon_list, errors)
+    plt.xlabel(r'$\epsilon$')
+    plt.ylabel(r'E')
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.tight_layout()
+    plt.xlim([epsilon_list[-1], epsilon_list[0]])
+    plt.show()
 
     # fem_problem.mesh.plot(u_true)
 

@@ -226,7 +226,7 @@ class Mesh:
         plt.xlabel("x")
         plt.ylabel("y")
         plt.title(title)
-        plt.grid(True)
+        # plt.grid(True)
         if values is None:
             plt.legend()
         plt.axis("equal")
