@@ -1,13 +1,14 @@
 """
 Inverse problem, including:
 Adjoint solver
-stiffness matrix grad w.r.t. conductivity. 
+stiffness matrix grad w.r.t. conductivity.
 """
 
 import numpy as np
 import numpy.typing as npt
 from scipy import sparse
 from .mesh import Mesh
+
 
 class FEMProblem:
     """
@@ -16,18 +17,29 @@ class FEMProblem:
     alternatively, you can provide a function which takes the mesh and returns indices of dirichlet nodes
 
     f and u_d can be set here, later with set_parameters, or when using inverse_step/forward.
-    
+
     rtol: relative tolerance of the linear solver
     """
 
     def __init__(
-        self, num_pixels: int, f=None, u_d=None, apply_dirichlet_on="boundary", rtol=1e-5, atol=1e-5
+        self,
+        num_pixels: int,
+        f=None,
+        u_d=None,
+        uhat=None,
+        u0=None,
+        apply_dirichlet_on="boundary",
+        rtol=1e-5,
+        atol=0.0,
     ):
-        print("making mesh...")
         self.atol = atol
         self.rtol = rtol
         self.f = f
         self.u_d = u_d
+        self.uhat = uhat
+        self.u0 = u0
+        self.w0 = None
+        print("making mesh...")
         self.mesh = Mesh(0.0, 1.0, 0.0, 1.0, num_pixels, num_pixels)
         self.dx = self.mesh.dx
         self.dy = self.mesh.dy
@@ -58,12 +70,26 @@ class FEMProblem:
         J = J.flatten()
         return I, J
 
-    """ set forcing and Dirichlet boundary conditions """
+    """
+    set forcing, Dirichlet boundary conditions and objective u
+    
+    f: forcing field. This includes at boundary nodes
+    u_d: vector of the same shape as u; contains boundary values at boundary nodes. It can be zero everywhere else.
+    uhat: measured uhat value.
+    u0: initial value for solver
+    """
 
-    def set_parameters(self, f: npt.NDArray[np.float64], u_d: npt.NDArray[np.float64]):
-        self.f = f
-        self.u_d = u_d * self.dirichlet_nodes_bool
-        
+    def set_parameters(
+        self,
+        f: npt.NDArray[np.float64] = None,
+        u_d: npt.NDArray[np.float64] = None,
+        uhat: npt.NDArray[np.float64] = None,
+        u0: npt.NDArray[np.float64] = None,
+    ):
+        self.f = f if not f is None else self.f
+        self.u_d = u_d if not u_d is None else self.u_d
+        self.uhat = uhat if not uhat is None else self.uhat
+        self.u0 = u0 if not u0 is None else self.u0
 
     """
     Processing to create stiffness matrix from kappa and apply boundary conditions
@@ -83,91 +109,99 @@ class FEMProblem:
         # cut out boundary nodes
         u_d = u_d * self.dirichlet_nodes_bool
         f_prob = f.copy() - K @ u_d
-        K = K[self.active_nodes_bool,:]
-        K = K[:,self.active_nodes_bool]
+        K = K[self.active_nodes_bool, :]
+        K = K[:, self.active_nodes_bool]
         f_prob = f_prob[self.active_nodes_bool]
         return K, f_prob
 
     """
     Solve forward problem, adjoint problem, and take gradient of \|u0-u_kappa\|^2 w.r.t. kappa.
-    
+
     kappa: conductivity field
-    f: forcing field. This includes at boundary nodes
-    uhat: measured uhat value.
     u0: initial guess of u
-    u_d: vector of the same shape as u; contains boundary values at boundary nodes. It can be zero everywhere else.
     """
 
     def inverse_step(
         self,
         kappa: npt.NDArray[np.float64],
-        uhat: npt.NDArray[np.float64],
         u0=None,
-        f=None,
-        u_d=None,
+        w0=None,
     ):
-        f = f if not f is None else self.f
-        u_d = u_d if not u_d is None else self.u_d
+        f = self.f
+        u_d = self.u_d
+        uhat = self.uhat
         assert not f is None, "f must be set with set_parameters()"
         assert not u_d is None, "u_d must be set with set_parameters()"
+        assert not uhat is None, "uhat must be set with set_parameters()"
         K, f = self.make_stiffness_and_bcs(kappa, f, u_d)
-        print(K)
         uhat = uhat[self.active_nodes_bool]
-        if (u0 == None):
-            u0 = uhat
-        else:
-            u0 = u0[self.active_nodes_bool]
         # solve forward problem
-        u_kappa, info1 = sparse.linalg.lgmres(K, f, x0=u0, rtol=self.rtol, atol=self.atol)
-        if(info1 > 0):
+        u_kappa, info1 = sparse.linalg.lgmres(
+            K, f, x0=u0, rtol=self.rtol, atol=self.atol
+        )
+        # u_kappa, info1 = sparse.linalg.lgmres(K, f, rtol=self.rtol, atol=self.atol)
+        if info1 > 0:
             print("Result of forward solver did not converge to tolerance")
-        if(info1 < 0):
+        if info1 < 0:
             print("Illegal input or breakdown in forward solver.")
         # solve adjoint problem
-        w, info2 = sparse.linalg.lgmres(K.T, uhat - u_kappa, rtol=self.rtol, atol=self.atol)
-        if (info2 > 0):
+        w, info2 = sparse.linalg.lgmres(
+            K.T, uhat - u_kappa, rtol=self.rtol, atol=self.atol
+        )
+        if info2 > 0:
             print("Result of adjoint solver did not converge to tolerance")
-        if(info1 < 0):
+        if info1 < 0:
             print("Illegal input or breakdown in adjoint solver.")
         # Add back boundary nodes
         u_kappa_ = np.zeros_like(u_d)
         u_kappa_[self.active_nodes_bool] = u_kappa
         u_kappa_[self.dirichlet_nodes_bool] = u_d[self.dirichlet_nodes_bool]
-        u_kappa = u_kappa_
+        # u_kappa = u_kappa_
         w_ = np.zeros_like(u_d)
         w_[self.active_nodes_bool] = w
-        w = w_
+        # w = w_
         # Take gradient
         dJ = np.zeros_like(kappa)
         for i, n in enumerate(self.connectivity.T):
-            dJ[i] = np.einsum(
-                "i,ij,j", u_kappa[n], self.Kprime_submatrix, w[n]
-            )
-        del K, w, w_
-        return u_kappa, dJ
+            dJ[i] = np.einsum("i,ij,j", u_kappa_[n], self.Kprime_submatrix, w_[n])
+        del K
+        return u_kappa_, dJ, u_kappa, w
 
     """
     A forward problem
-    
+
     kappa: conductivity field
-    f: forcing field. This includes at boundary nodes
     u0: initial guess of u
-    u_d: vector of the same shape as u; contains boundary values at boundary nodes. It can be zero everywhere else.
     """
 
-    def forward(self, kappa: npt.NDArray[np.float64], u0=None, f=None, u_d=None):
-        f = f if not f is None else self.f
-        u_d = u_d if not u_d is None else self.u_d
+    def forward(self, kappa: npt.NDArray[np.float64], u0=None):
+        f = self.f
+        u_d = self.u_d
         assert not f is None, "f must be set with set_parameters()"
         assert not u_d is None, "u_d must be set with set_parameters()"
         K, f = self.make_stiffness_and_bcs(kappa, f, u_d)
-        u_kappa, info = sparse.linalg.lgmres(K, f, rtol=self.rtol)
+        u_kappa, info = sparse.linalg.lgmres(K, f, rtol=self.rtol, x0=u0)
         # Add back boundary nodes
         u_kappa_ = np.zeros_like(u_d)
         u_kappa_[self.dirichlet_nodes_bool] = u_d[self.dirichlet_nodes_bool]
         u_kappa_[self.active_nodes_bool] = u_kappa
         del K
         return u_kappa_
+
+    """ Evaluates objective, calling forward """
+
+    def objective(self, kappa: npt.NDArray[np.float64]):
+        u_kappa_ = self.forward(kappa)
+        return 0.5 * np.sum((u_kappa_ - self.uhat) ** 2)
+
+    """ Evaluates gradient of objective, calling inverse_step """
+
+    def gradient(self, kappa: npt.NDArray[np.float64]):
+        # save solution to use as initial value for next solve.
+        u_kappa_, dJ, u_kappa, w = self.inverse_step(kappa, self.u0, self.w0)
+        self.u0 = u_kappa
+        self.w0 = w
+        return dJ
 
 
 """
@@ -178,236 +212,253 @@ verify gradient of functional with finite differences
 def verify_gradient(
     fem_problem: FEMProblem,
     kappa: npt.NDArray[np.float64],
-    u0: npt.NDArray[np.float64],
+    uhat: npt.NDArray[np.float64],
     epsilon: float | list[float],
-    dirs = None,
+    dirs=None,
 ) -> np.float64 | npt.NDArray[np.float64]:
-    u_kappa, dJ = fem_problem.inverse_step(kappa, u0)
-    J0 = 0.5*np.sum((u_kappa - u0) ** 2)
+    u_kappa, dJ = fem_problem.inverse_step(kappa)
+    J0 = 0.5 * np.sum((u_kappa - uhat) ** 2)
     if dirs == None:
         # chose 10 random unissst directions
         dirs = np.random.randn(10, kappa.size)
         dirs = dirs / np.linalg.norm(dirs, axis=1).reshape(-1, 1)
-    if isinstance(epsilon, (list, np.ndarray)) :
+    if isinstance(epsilon, (list, np.ndarray)):
         err_list = []
         for e in epsilon:
             d_errs = []
             for dir in dirs:
                 u_kappa_d = fem_problem.forward(kappa + e * dir)
-                Jd = 0.5*np.sum((u_kappa_d - u0) ** 2)
-                print(Jd)
+                Jd = 0.5 * np.sum((u_kappa_d - uhat) ** 2)
                 fd_dir_grad = (Jd - J0) / e
                 exact_dir_grad = np.dot(dJ, dir)
-                print('fd:', fd_dir_grad)
-                print('dJ:', exact_dir_grad)
-                d_errs.append((fd_dir_grad - exact_dir_grad)/(exact_dir_grad))
+                d_errs.append((fd_dir_grad - exact_dir_grad) / (exact_dir_grad))
             err_list.append(np.sqrt(np.mean(np.array(d_errs) ** 2)))
         return dJ, np.array(err_list)
     else:
         d_errs = []
         for dir in dirs:
             u_kappa_d = fem_problem.forward(kappa + epsilon * dir)
-            Jd = np.sum((u_kappa_d - u0) ** 2)
+            Jd = np.sum((u_kappa_d - uhat) ** 2)
             exact_dir_grad = np.dot(dJ, dir)
-            print('fd:', fd_dir_grad)
-            print('dJ:', exact_dir_grad)
-            d_errs.append((fd_dir_grad - exact_dir_grad)/(exact_dir_grad))
+            d_errs.append((fd_dir_grad - exact_dir_grad) / (exact_dir_grad))
         return dJ, np.sqrt(np.mean(np.array(d_errs) ** 2))
+
 
 #   Test gradient with zero BCs and forcing
 def test_gradient_1():
     import matplotlib.pyplot as plt
+
     fem_problem = FEMProblem(64, rtol=1e-9)
 
     u_d = np.zeros(fem_problem.num_nodes)
     node_coords = fem_problem.mesh.coordinates
-    f = node_coords[0, :]**2 + node_coords[1, :]**2
+    f = node_coords[0, :] ** 2 + node_coords[1, :] ** 2
     elem_coords = fem_problem.mesh.get_element_coordinates(
-        np.arange(fem_problem.mesh.num_elements)[:]
+        np.arange(fem_problem.num_elements)[:]
     )
     y_vals = np.mean(np.array(elem_coords)[0, :, :], axis=0)
     kappa = 1 + 100 * y_vals
-    fem_problem.set_parameters(f, u_d)
+    fem_problem.set_parameters(f=f, u_d=u_d)
     u_true = fem_problem.forward(kappa)
     fem_problem.mesh.plot(u_true)
+    uhat = u_true + 0.1 * np.random.randn(u_true.size)
+    uhat[fem_problem.dirichlet_nodes] = u_d[fem_problem.dirichlet_nodes]
+    kappa_noise = np.random.randn(kappa.size)
+    kappa = kappa + 0.5 * kappa_noise / np.linalg.norm(kappa_noise)
 
     # test gradient
-    u0 = u_true + 0.1 * np.random.randn(u_true.size)
-    kappa_noise = np.random.randn(kappa.size)
-    kappa = kappa + 0.5 * kappa_noise/np.linalg.norm(kappa_noise)
+    fem_problem.set_parameters(uhat=uhat)
     epsilon_list = np.array([1, 0.1, 0.01, 0.001, 0.0001, 0.00001])
-    dJ, errors = verify_gradient(fem_problem, kappa, u0, epsilon_list)
-    # errors = errors/np.linalg.norm(dJ)
+    dJ, errors = verify_gradient(fem_problem, kappa, uhat, epsilon_list)
 
-    print('errors:', errors)
-    print(np.linalg.norm(dJ))
-    # log_epsilon_list =  np.log(epsilon_list)
     plt.figure()
     plt.plot(epsilon_list, errors)
-    plt.xlabel(r'$\epsilon$')
-    plt.ylabel(r'E')
-    plt.xscale('log')
-    plt.yscale('log')
+    plt.xlabel(r"$\epsilon$")
+    plt.ylabel(r"E")
+    plt.xscale("log")
+    plt.yscale("log")
     plt.tight_layout()
     plt.xlim([epsilon_list[-1], epsilon_list[0]])
     plt.show()
+
 
 # Test gradient with zero forcing and nonzero BCs
 def test_gradient_2():
     import matplotlib.pyplot as plt
-    fem_problem = FEMProblem(4, rtol=1e-9)
+
+    fem_problem = FEMProblem(64, rtol=1e-12)
     # define boundary condition
     u_d = fem_problem.mesh.coordinates[0, :]
     # make a conductivity field
     elem_coords = fem_problem.mesh.get_element_coordinates(
-        np.arange(fem_problem.mesh.num_elements)[:]
+        np.arange(fem_problem.num_elements)[:]
     )
     y_vals = np.mean(np.array(elem_coords)[0, :, :], axis=0)
     kappa = 1 + 100 * y_vals
     f = np.zeros_like(u_d)
-    fem_problem.set_parameters(f, u_d)
-
+    fem_problem.set_parameters(f=f, u_d=u_d)
     u_true = fem_problem.forward(kappa)
     fem_problem.mesh.plot(u_true)
+    uhat = u_true + 0.1 * np.random.randn(u_true.size)
+    uhat[fem_problem.dirichlet_nodes] = u_d[fem_problem.dirichlet_nodes]
+    kappa_noise = np.random.randn(kappa.size)
+    kappa = kappa + 0.5 * kappa_noise / np.linalg.norm(kappa_noise)
 
     # test gradient
-    u0 = u_true + 0.1 * np.random.randn(u_true.size)
-    u0[fem_problem.dirichlet_nodes] = u_d[fem_problem.dirichlet_nodes]
-    kappa_noise = np.random.randn(kappa.size)
-    kappa = kappa + 0.5 * kappa_noise/np.linalg.norm(kappa_noise)
-    epsilon_list = np.array([1, 0.1, 0.01, 0.001, 0.0001, 0.00001, 0.000001])
-    dJ, errors = verify_gradient(fem_problem, kappa, u0, epsilon_list)
-    print('errors:', errors)
-    # errors = errors/np.linalg.norm(dJ)
+    fem_problem.set_parameters(uhat=uhat)
+    epsilon_list = np.array([1, 0.1, 0.01, 0.001, 0.0001, 0.00001])
+    dJ, errors = verify_gradient(fem_problem, kappa, uhat, epsilon_list)
 
-    print(np.linalg.norm(dJ))
-    # log_epsilon_list =  np.log(epsilon_list)
     plt.figure()
     plt.plot(epsilon_list, errors)
-    plt.xlabel(r'$\epsilon$')
-    plt.ylabel(r'E')
-    plt.xscale('log')
-    plt.yscale('log')
+    plt.xlabel(r"$\epsilon$")
+    plt.ylabel(r"E")
+    plt.xscale("log")
+    plt.yscale("log")
     plt.tight_layout()
     plt.xlim([epsilon_list[-1], epsilon_list[0]])
     plt.show()
 
-def example_inverse_problem():
-    pass
 
-if __name__ == "__main__":
-    test_gradient_1()
-    # test_gradient_2()
-    np.random.seed(42)
-    fem_problem = FEMProblem(64, rtol=0.0, atol=1e-10)
+# Solving an inverse problem
+def example_inverse_problem():
+    import matplotlib.pyplot as plt
+    from scipy.optimize import minimize, OptimizeResult
+    import time
+
+    # problem setup is the same as test_gradient_1
+
+    fem_problem = FEMProblem(64, rtol=1e-9)
+
+    # u_d = np.zeros(fem_problem.num_nodes)
+    # node_coords = fem_problem.mesh.coordinates
+    # f = node_coords[0, :]**2 + node_coords[1, :]**2
+    elem_coords = fem_problem.mesh.get_element_coordinates(
+        np.arange(fem_problem.num_elements)[:]
+    )
+    elem_coords = np.array(elem_coords)
+    x_vals = np.mean(elem_coords[1, :, :], axis=0)
+    y_vals = np.mean(elem_coords[0, :, :], axis=0)
+    # kappa = 1 + 100 * y_vals
+    # fem_problem.set_parameters(f=f, u_d=u_d)
+
+    # fem_problem = FEMProblem(64, rtol=1e-12)
     # define boundary condition
     u_d = fem_problem.mesh.coordinates[0, :]
-    # u_d = np.ones(fem_problem.num_nodes)
-    # u_d[0] = 1.
-    # u_d[1] = 1.
-    # u_d[2] = 1.
-    # u_d[3] = 1.
-    # u_d[4] = 1.
-    # u_d[5] = 1.
-    # u_d[6] = 1.
-    print(fem_problem.mesh.coordinates)
     # make a conductivity field
     elem_coords = fem_problem.mesh.get_element_coordinates(
-        np.arange(fem_problem.mesh.num_elements)[:]
+        np.arange(fem_problem.num_elements)[:]
     )
     y_vals = np.mean(np.array(elem_coords)[0, :, :], axis=0)
-    kappa = (1 + 100 * y_vals)*0.01
-    # kappa = np.ones(fem_problem.num_elements)
+    kappa = 1 + 100 * y_vals
     f = np.zeros_like(u_d)
-    fem_problem.set_parameters(f, u_d)
-
-    kappa_noise = np.random.randn(kappa.size)
-    kappa = kappa + 0.5 * kappa_noise/np.linalg.norm(kappa_noise)
+    fem_problem.set_parameters(f=f, u_d=u_d)
 
     u_true = fem_problem.forward(kappa)
-    print(u_true)
-    
-    fem_problem.mesh.plot(u_true)
+    fem_problem.set_parameters(uhat=u_true)
 
-    # test gradient
-    u0 = u_true + 0.1 * np.random.randn(u_true.size)
-    u0[fem_problem.dirichlet_nodes] = u_d[fem_problem.dirichlet_nodes]
+    # a noisy guess of kappa
     # kappa_noise = np.random.randn(kappa.size)
-    # kappa = kappa + 0.5 * kappa_noise/np.linalg.norm(kappa_noise)
-    
-    K, f_prob = fem_problem.make_stiffness_and_bcs(kappa, f, u_d)
-    
-    print(K.shape)
-    print(f_prob)
-    
-    epsilon_list = np.array([1, 0.1, 0.01, 0.001, 0.0001, 0.00001, 0.000001])
-    dJ, errors = verify_gradient(fem_problem, kappa, u0, epsilon_list)
-    print('errors:', errors)
-    
-    import matplotlib.pyplot as plt
-    print(np.linalg.norm(dJ))
-    # log_epsilon_list =  np.log(epsilon_list)
-    plt.figure()
-    plt.plot(epsilon_list, errors)
-    plt.xlabel(r'$\epsilon$')
-    plt.ylabel(r'E')
-    plt.xscale('log')
-    plt.yscale('log')
+    # kappa0 = kappa + 5 * kappa_noise
+    # kappa0[kappa0 < 0] = 0
+    kappa0 = np.full_like(kappa, 50)
+    kappa0 += 20 * np.random.randn(kappa0.size)
+    kappa0[kappa < 0] = 0
+
+    options = {
+        "c1": 0.2,
+        # 'c2':
+        "maxiter": 100,
+        "norm": 2,
+        "return_all": True,
+    }
+
+    def callback(intermediate_result: OptimizeResult):
+        kappa_current = intermediate_result.x
+        J = intermediate_result.fun
+        if not hasattr(callback, "count"):
+            callback.count = 0
+        callback.count += 1
+        # J = 0.5*np.sum((u_true - uk)**2)
+        print(np.linalg.norm(kappa0 - kappa_current))
+        print(
+            f"finished iteration {callback.count} with distance {np.linalg.norm(kappa - kappa_current):.4f}, objective {J:.4f}"
+        )
+
+    start_time = time.perf_counter()
+    returned = minimize(
+        fem_problem.objective,
+        kappa0.copy(),
+        method="bfgs",
+        jac=fem_problem.gradient,
+        options=options,
+        callback=callback,
+    )
+    end_time = time.perf_counter()
+    kappa_vals = returned["allvecs"]
+    kappa_found = returned["x"]
+
+    # for i in range(500):
+    #     uk, dJ, _, _ = fem_problem.inverse_step(kappa_found)
+    #     J = 0.5*np.sum((u_true-uk)**2)
+    #     print("finished iteration", i, "with distance",
+    #           np.linalg.norm(kappa - kappa_found), "objective", J)
+    #     kappa_found -= 0.1*dJ
+
+    fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(1, 5, sharex=True, sharey=True)
+    ax1.tricontourf(
+        x_vals,
+        y_vals,
+        kappa,
+        20,
+        cmap="viridis",
+        vmin=0,
+        vmax=100,
+    )
+    ax2.tricontourf(
+        x_vals,
+        y_vals,
+        kappa0,
+        20,
+        cmap="viridis",
+        vmin=0,
+        vmax=100,
+    )
+    ax3.tricontourf(
+        x_vals,
+        y_vals,
+        kappa_found,
+        20,
+        cmap="viridis",
+        vmin=0,
+        vmax=100,
+    )
+    ax4.tricontourf(
+        x_vals,
+        y_vals,
+        kappa0 - kappa,
+        20,
+        cmap="viridis",
+        vmin=-50,
+        vmax=50,
+    )
+    ax5.tricontourf(
+        x_vals,
+        y_vals,
+        kappa0 - kappa_found,
+        20,
+        cmap="viridis",
+        vmin=-50,
+        vmax=50,
+    )
     plt.tight_layout()
-    plt.xlim([epsilon_list[-1], epsilon_list[0]])
     plt.show()
 
-    # fem_problem.mesh.plot(u_true)
-
-    # test gradient
-    # u0 = u_true + 0.1 * np.random.randn(u_true.size)
-    # kappa_noise = np.random.randn(kappa.size)
-    # kappa = kappa + 0.5 * kappa_noise/np.linalg.norm(kappa_noise)
-    # epsilon_list = np.array([1, 0.1, 0.01, 0.001, 0.0001, 0.00001])
-    # dJ, errors = verify_gradient(fem_problem, kappa, u0, epsilon_list)
-    # errors = errors/np.linalg.norm(dJ)
-
-    # print(errors)
-    # import matplotlib.pyplot as plt
-
-    # plt.figure()
-    # plt.plot(np.log(epsilon_list), np.log(errors))
-    # plt.show()
-    
-    # solve for kappa
-    # rate = 0.1
-    # kappa_est = np.ones(fem_problem.mesh.num_elements)
-    # kappa_conv = []
-    # J_conv = []
-    # for i in range(200):
-    #     print('iteration', i)
-    #     u_kappa, dJ = fem_problem.inverse_step(kappa_est, u_true)
-        
-    #     J = np.sum((u_true - u_kappa)**2)
-    #     J_conv.append(J)
-    #     kappa_err = np.sum((kappa - kappa_est)**2)
-    #     kappa_conv.append(kappa_err)
-    #     kappa_est -= rate*dJ
-    # print(kappa_err.shape)
-    # fig, (ax1, ax2) = plt.subplots(2, 1)
-    # ax1.plot(J_conv)
-    # ax2.plot(kappa_conv)
-    # plt.show()
-    # print(u_d.shape)
+    fem_problem.mesh.plot(uk)
 
 
-
-    # I, J = fem_problem.I, fem_problem.J
-    # Kprime_submatrix = np.array([
-    #     [4, -1, -2, -1],
-    #     [-1, 4, -1, -2],
-    #     [-2, -1, 4, -1],
-    #     [-1, -2, -1, 4]
-    # ], dtype=float)
-    # kappa = np.ones(fem_problem.mesh.num_elements)
-    # k_data = Kprime_submatrix.reshape(-1, 1)*kappa.reshape(1, -1)
-    # k_data = k_data.flatten()
-    # K = sparse.csr_array((k_data, (fem_problem.I, fem_problem.J)), shape=(fem_problem.num_nodes, fem_problem.num_nodes))
-    # dirichlet_nodes = fem_problem.dirichlet_nodes
-    # K = K[:,dirichlet_nodes]
-    # K = K[dirichlet_nodes,:]
+if __name__ == "__main__":
+    np.random.seed(43)
+    # test_gradient_1()
+    # test_gradient_2()
+    example_inverse_problem()
