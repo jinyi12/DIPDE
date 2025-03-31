@@ -1,0 +1,8 @@
+*.pyc
+*.so
+*.dylib
+*.a
+*.lib
+*.dll
+*.exp
+*.DS_Store
