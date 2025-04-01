@@ -6,3 +6,9 @@
 *.dll
 *.exp
 *.DS_Store
+wandb/
+*.png
+*.npy
+*.pt
+*.pth
+*.pkl

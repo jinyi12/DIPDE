@@ -16,6 +16,7 @@ from scipy.interpolate import griddata
 from pathlib import Path
 import argparse
 from tqdm import tqdm
+import wandb  # Import wandb
 
 
 def load_coarse_data(input_folder: str) -> tuple:
@@ -175,9 +176,9 @@ def interpolate_samples_torch(
     return kappa_fine_samples
 
 
-def save_interpolated_data(kappa_fine_samples: np.ndarray, output_folder: str) -> None:
+def save_interpolated_data(kappa_fine_samples: np.ndarray, output_folder: str) -> Path:
     """
-    Save interpolated data to disk.
+    Save interpolated data to disk and return the file path.
 
     Parameters
     ----------
@@ -185,14 +186,25 @@ def save_interpolated_data(kappa_fine_samples: np.ndarray, output_folder: str) -
         Interpolated samples on fine grid
     output_folder : str
         Path to save the interpolated data
+
+    Returns
+    -------
+    Path
+        Path to the saved numpy file
     """
     output_path = Path(output_folder)
     output_path.mkdir(exist_ok=True)
 
-    # Save interpolated samples
-    np.save(output_path / "kappa_fine_samples.npy", kappa_fine_samples)
+    # Define save path
+    save_file_path = output_path / "kappa_fine_samples.npy"
 
-    print(f"Saved interpolated samples with shape {kappa_fine_samples.shape}")
+    # Save interpolated samples
+    np.save(save_file_path, kappa_fine_samples)
+
+    print(
+        f"Saved interpolated samples with shape {kappa_fine_samples.shape} to {save_file_path}"
+    )
+    return save_file_path  # Return the path
 
 
 def plot_comparison(
@@ -381,6 +393,25 @@ def main():
         ly = 1.0
         method = "cubic"
 
+    # Initialize WandB
+    run = wandb.init(
+        project="DIPDE",
+        entity="ECE689AdvDL",
+        job_type="data_upload",  # Use job_type for categorization
+        tags=["upload"],  # Tag the run
+        config={  # Log hyperparameters
+            "input_folder": input_folder,
+            "output_folder": output_folder,
+            "nx_coarse": nx_coarse,
+            "ny_coarse": ny_coarse,
+            "nx_fine": nx_fine,
+            "ny_fine": ny_fine,
+            "lx": lx,
+            "ly": ly,
+            "method": method,
+        },
+    )
+
     print(
         f"Interpolating from {nx_coarse}x{ny_coarse} grid to {nx_fine}x{ny_fine} grid"
     )
@@ -393,8 +424,30 @@ def main():
         kappa_samples, nx_coarse, ny_coarse, nx_fine, ny_fine, lx, ly, method
     )
 
-    # Save interpolated data
-    save_interpolated_data(kappa_fine_samples, output_folder)
+    # Save interpolated data and get the path
+    saved_file_path = save_interpolated_data(kappa_fine_samples, output_folder)
+
+    # Create and log artifact
+    artifact_name = f"kappa_field_pair-{nx_coarse}x{ny_coarse}-to-{nx_fine}x{ny_fine}"  # More descriptive name
+    artifact = wandb.Artifact(
+        name=artifact_name,  # Use the new name
+        type="dataset",
+        # Updated description to mention both files
+        description=f"Coarse ({nx_coarse}x{ny_coarse}) and interpolated fine ({nx_fine}x{ny_fine}) random field samples.",
+        metadata=wandb.config.as_dict(),
+    )
+    # add the saved file (Fine Samples)
+    artifact.add_file(
+        str(saved_file_path), name="kappa_fine_samples.npy"
+    )  # Optionally specify name in artifact
+    # add the coarse grid samples
+    artifact.add_file(
+        str(Path(input_folder) / "kappa_samples.npy"), name="kappa_coarse_samples.npy"
+    )  # Optionally specify name
+    print(f"Added fine and coarse grid samples to artifact {artifact.name}.")
+
+    run.log_artifact(artifact)
+    print(f"Logged artifact {artifact.name} to WandB.")
 
     # Plot comparison
     plot_comparison(
@@ -410,6 +463,7 @@ def main():
     )
 
     print("Interpolation completed successfully!")
+    run.finish()  # Finish the wandb run
 
 
 if __name__ == "__main__":

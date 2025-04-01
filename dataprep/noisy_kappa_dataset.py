@@ -12,6 +12,7 @@ from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 from typing import Optional, Tuple, Union
 import logging
+import wandb
 
 import matplotlib.pyplot as plt
 import argparse
@@ -196,6 +197,9 @@ def create_noisy_kappa_dataloader(
     num_workers: int = 0,
     device: str = "cpu",
     seed: Optional[int] = None,
+    is_artifact: bool = False,
+    wandb_run: Optional[wandb.sdk.wandb_run.Run] = None,
+    artifact_filename: str = "kappa_fine_samples.npy",
 ) -> DataLoader:
     """
     Create a DataLoader for the noisy kappa field dataset.
@@ -203,7 +207,7 @@ def create_noisy_kappa_dataloader(
     Parameters
     ----------
     data_path : Union[str, Path]
-        Path to the .npy file containing kappa fields
+        Path to the .npy file OR WandB artifact identifier
     batch_size : int
         Batch size for the dataloader
     snr_db_min : float
@@ -218,14 +222,35 @@ def create_noisy_kappa_dataloader(
         Device to store the data on ('cpu' or 'cuda')
     seed : Optional[int]
         Random seed for reproducibility
+    is_artifact : bool
+        Set to True if data_path is a WandB artifact identifier
+    wandb_run : Optional[wandb.sdk.wandb_run.Run]
+        The active WandB run instance (required if is_artifact is True)
+    artifact_filename : str
+        The specific filename to load from within the artifact (defaults to 'kappa_fine_samples.npy')
 
     Returns
     -------
     DataLoader
         DataLoader for the noisy kappa field dataset
     """
+    actual_data_path = data_path
+    if is_artifact:
+        if wandb_run is None:
+            raise ValueError("wandb_run must be provided when is_artifact is True")
+        print(f"Using artifact: {data_path}")
+        # Download the artifact
+        artifact = wandb_run.use_artifact(data_path, type="dataset")
+        # Get the directory where artifact files are downloaded
+        artifact_dir = Path(artifact.download())
+        # Construct the path to the specific file within the artifact directory
+        actual_data_path = artifact_dir / artifact_filename
+        print(f"Loading data from artifact file: {actual_data_path}")
+    else:
+        print(f"Loading data from local path: {actual_data_path}")
+
     dataset = NoisyKappaFieldDataset(
-        data_path=data_path,
+        data_path=actual_data_path,
         snr_db_min=snr_db_min,
         snr_db_max=snr_db_max,
         reshape_size=reshape_size,
@@ -248,9 +273,23 @@ def create_noisy_kappa_dataloader(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--data_path",
+        "--data_input",
         type=str,
-        default="/data1/jy384/research/Data/DIPDE/kappa_fine_samples.npy",
+        default="ECE689AdvDL/DIPDE/kappa_field_pair-32x32-to-256x256:latest",
+        help="Path to local .npy file OR WandB artifact identifier (e.g., 'entity/project/name:version')",
+    )
+    parser.add_argument(
+        "--input_type",
+        type=str,
+        default="artifact",
+        choices=["artifact", "local"],
+        help="Specify whether the data_input is a 'local' path or a 'artifact' identifier",
+    )
+    parser.add_argument(
+        "--artifact_filename",
+        type=str,
+        default="kappa_fine_samples.npy",
+        help="Filename to load from within the artifact (if using artifact input_type)",
     )
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--snr_db_min", type=float, default=10.0)
@@ -263,22 +302,48 @@ if __name__ == "__main__":
     )
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="DIPDE",
+        help="WandB project name for this run",
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default="ECE689AdvDL",
+        help="WandB entity (team) name",
+    )
+
     args = parser.parse_args()
+
+    # Initialize WandB run for this script (needed for using artifacts)
+    run = wandb.init(
+        project=args.wandb_project, entity=args.wandb_entity, job_type="tests"
+    )
+    # Log config
+    wandb.config.update(args)
 
     # Handle reshape_size based on individual dimensions
     reshape_size = None
     if args.reshape_ny is not None and args.reshape_nx is not None:
         reshape_size = (args.reshape_ny, args.reshape_nx)
 
+    # Determine if input is an artifact
+    is_artifact_input = args.input_type == "artifact"
+
     # Create dataloader
     dataloader = create_noisy_kappa_dataloader(
-        data_path=args.data_path,
+        data_path=args.data_input,
         batch_size=args.batch_size,
         snr_db_min=args.snr_db_min,
         snr_db_max=args.snr_db_max,
         reshape_size=reshape_size,
         device=args.device,
         seed=args.seed,
+        is_artifact=is_artifact_input,
+        wandb_run=run,
+        artifact_filename=args.artifact_filename,
     )
 
     # the dataset and dataloader usage
@@ -317,3 +382,6 @@ if __name__ == "__main__":
     noisy_batch, clean_batch = next(iter(dataloader))
     print("Plotting first sample")
     plot_sample_pair(noisy_batch[0], clean_batch[0], (args.snr_db_min, args.snr_db_max))
+
+    # Finish the WandB run for this script
+    run.finish()
