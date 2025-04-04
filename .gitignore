@@ -13,3 +13,4 @@ wandb/
 *.pth
 *.pkl
 *.pyc
+/__pycache__/*
