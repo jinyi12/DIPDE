@@ -12,3 +12,4 @@ wandb/
 *.pt
 *.pth
 *.pkl
+*.pyc
