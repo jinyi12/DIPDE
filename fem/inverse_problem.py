@@ -8,6 +8,7 @@ import numpy as np
 import numpy.typing as npt
 from scipy import sparse
 from .mesh import Mesh
+from scipy.optimize import minimize, OptimizeResult
 
 
 class FEMProblem:
@@ -55,7 +56,13 @@ class FEMProblem:
         self.dirichlet_nodes_bool = np.zeros(self.num_nodes, dtype=bool)
         self.dirichlet_nodes_bool[self.dirichlet_nodes] = True
         self.active_nodes_bool = np.logical_not(self.dirichlet_nodes_bool)
-        self.Kprime_submatrix = np.array(
+        # self.Kprime_submatrix = np.array(
+        #     [[4, -1, -2, -1], [-1, 4, -1, -2], [-2, -1, 4, -1], [-1, -2, -1, 4]],
+        #     dtype=float,
+        # )
+        # For a uniform square mesh, self.dx = self.dy = h, so we introduce a factor 1/(6h^2)
+        scale = 1.0 / (6 * self.dx**2)
+        self.Kprime_submatrix = scale * np.array(
             [[4, -1, -2, -1], [-1, 4, -1, -2], [-2, -1, 4, -1], [-1, -2, -1, 4]],
             dtype=float,
         )
@@ -317,6 +324,7 @@ def test_gradient_2():
     plt.yscale("log")
     plt.tight_layout()
     plt.xlim([epsilon_list[-1], epsilon_list[0]])
+    plt.savefig("figures/gradient_error.png")
     plt.show()
 
 
@@ -386,17 +394,28 @@ def example_inverse_problem():
         )
 
     start_time = time.perf_counter()
-    returned = minimize(
-        fem_problem.objective,
-        kappa0.copy(),
-        method="bfgs",
-        jac=fem_problem.gradient,
-        options=options,
-        callback=callback,
-    )
+    max_restarts = 5
+    current_guess = kappa0.copy()
+    for i in range(max_restarts):
+        result = minimize(
+            fem_problem.objective,
+            current_guess,
+            method="L-BFGS-B",
+            jac=fem_problem.gradient,
+            callback=callback,
+            options=options,
+            bounds=[(0.1, None) for _ in range(kappa.size)],
+        )
+        current_guess = result.x
+        # Check if termination criteria (e.g. gradient norm) are still above a threshold
+        if np.linalg.norm(fem_problem.gradient(current_guess)) > 1e-6:
+            print(f"Restarting optimization: restart {i + 1}")
+        else:
+            break
+
     end_time = time.perf_counter()
-    kappa_vals = returned["allvecs"]
-    kappa_found = returned["x"]
+    # kappa_vals = returned["allvecs"]
+    # kappa_found = returned["x"]
 
     # for i in range(500):
     #     uk, dJ, _, _ = fem_problem.inverse_step(kappa_found)
@@ -404,6 +423,9 @@ def example_inverse_problem():
     #     print("finished iteration", i, "with distance",
     #           np.linalg.norm(kappa - kappa_found), "objective", J)
     #     kappa_found -= 0.1*dJ
+
+    kappa_found = result["allvecs"]
+    kappa_found = kappa_found["x"]
 
     fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(1, 5, sharex=True, sharey=True)
     ax1.tricontourf(
@@ -452,9 +474,13 @@ def example_inverse_problem():
         vmax=50,
     )
     plt.tight_layout()
+    plt.savefig("figures/kappa_comparison.png")
     plt.show()
 
-    fem_problem.mesh.plot(uk)
+    u_kappa_found = fem_problem.forward(kappa_found)
+    fem_problem.mesh.plot(u_kappa_found, title="u_kappa_found")
+
+    # fem_problem.mesh.plot(uk)
 
 
 if __name__ == "__main__":

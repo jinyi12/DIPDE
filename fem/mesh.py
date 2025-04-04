@@ -230,4 +230,5 @@ class Mesh:
         if values is None:
             plt.legend()
         plt.axis("equal")
+        plt.savefig(f"figures/{title}.png")
         plt.show()
