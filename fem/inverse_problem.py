@@ -66,16 +66,19 @@ class FEMProblem:
             [[4, -1, -2, -1], [-1, 4, -1, -2], [-2, -1, 4, -1], [-1, -2, -1, 4]],
             dtype=float,
         )
-        self.I, self.J = self._get_ij()
+        self._set_ij()
+        self.Ka = None
+        self.Kd = None
 
-    def _get_ij(self):
+    def _set_ij(self):
         I = np.expand_dims(self.connectivity, axis=0)
         I = np.tile(I, (4, 1, 1))
         I = I.flatten()
         J = np.expand_dims(self.connectivity, axis=1)
         J = np.tile(J, (1, 4, 1))
         J = J.flatten()
-        return I, J
+        self.I = I
+        self.J = J
 
     """
     set forcing, Dirichlet boundary conditions and objective u
@@ -108,19 +111,23 @@ class FEMProblem:
         f: npt.NDArray[np.float64],
         u_d: npt.NDArray[np.float64],
     ) -> tuple[npt.NDArray[np.float64] : npt.NDArray[np.float64]]:
-        k_data = (self.Kprime_submatrix.reshape(-1, 1) * kappa.reshape(1, -1)).flatten()
-        K = sparse.csr_array(
-            (k_data, (self.I, self.J)), shape=(self.num_nodes, self.num_nodes)
-        )
-        K.sum_duplicates()
-        # cut out boundary nodes
-        u_d = u_d * self.dirichlet_nodes_bool
-        f_prob = f.copy() - K @ u_d
-        K = K[self.active_nodes_bool, :]
-        K = K[:, self.active_nodes_bool]
-        f_prob = f_prob[self.active_nodes_bool]
-        return K, f_prob
-
+        # kappa_d = kappa[self.dirichlet_nodes_bool]
+        # kappa_a = kappa[self.active_nodes_bool]
+        if(True):
+            k_data = (self.Kprime_submatrix.reshape(-1, 1) * kappa.reshape(1, -1)).flatten()
+            K = sparse.csr_array(
+                (k_data, (self.I, self.J)), shape=(self.num_nodes, self.num_nodes)
+            )
+            K.sum_duplicates()
+            # cut out boundary nodes
+            self.Kd = K[self.active_nodes_bool,:][:,self.dirichlet_nodes_bool]
+            f_prob = f[self.active_nodes_bool] - self.Kd @ u_d[self.dirichlet_nodes_bool]
+            self.Ka = K[self.active_nodes_bool, :][:, self.active_nodes_bool]
+            
+            f_prob = f_prob[self.active_nodes_bool]
+            return self.Ka, f_prob
+        else:
+            pass
     """
     Solve forward problem, adjoint problem, and take gradient of \|u0-u_kappa\|^2 w.r.t. kappa.
 
@@ -187,7 +194,7 @@ class FEMProblem:
         assert not f is None, "f must be set with set_parameters()"
         assert not u_d is None, "u_d must be set with set_parameters()"
         K, f = self.make_stiffness_and_bcs(kappa, f, u_d)
-        u_kappa, info = sparse.linalg.lgmres(K, f, rtol=self.rtol, x0=u0)
+        u_kappa, info = sparse.linalg.lgmres(K, f, rtol=self.rtol, atol=self.atol, x0=u0)
         # Add back boundary nodes
         u_kappa_ = np.zeros_like(u_d)
         u_kappa_[self.dirichlet_nodes_bool] = u_d[self.dirichlet_nodes_bool]
@@ -223,7 +230,7 @@ def verify_gradient(
     epsilon: float | list[float],
     dirs=None,
 ) -> np.float64 | npt.NDArray[np.float64]:
-    u_kappa, dJ = fem_problem.inverse_step(kappa)
+    u_kappa, dJ, _, _ = fem_problem.inverse_step(kappa)
     J0 = 0.5 * np.sum((u_kappa - uhat) ** 2)
     if dirs == None:
         # chose 10 random unissst directions
@@ -336,7 +343,7 @@ def example_inverse_problem():
 
     # problem setup is the same as test_gradient_1
 
-    fem_problem = FEMProblem(64, rtol=1e-9)
+    fem_problem = FEMProblem(128, rtol=1e-9)
 
     # u_d = np.zeros(fem_problem.num_nodes)
     # node_coords = fem_problem.mesh.coordinates
@@ -374,11 +381,11 @@ def example_inverse_problem():
     kappa0[kappa < 0] = 0
 
     options = {
-        "c1": 0.2,
+        # "c1": 0.2,
         # 'c2':
         "maxiter": 100,
-        "norm": 2,
-        "return_all": True,
+        # "norm": 2,
+        # "return_all": True,
     }
 
     def callback(intermediate_result: OptimizeResult):
@@ -388,7 +395,7 @@ def example_inverse_problem():
             callback.count = 0
         callback.count += 1
         # J = 0.5*np.sum((u_true - uk)**2)
-        print(np.linalg.norm(kappa0 - kappa_current))
+        # print(np.linalg.norm(kappa0 - kappa_current))
         print(
             f"finished iteration {callback.count} with distance {np.linalg.norm(kappa - kappa_current):.4f}, objective {J:.4f}"
         )
@@ -424,8 +431,8 @@ def example_inverse_problem():
     #           np.linalg.norm(kappa - kappa_found), "objective", J)
     #     kappa_found -= 0.1*dJ
 
-    kappa_found = result["allvecs"]
-    kappa_found = kappa_found["x"]
+    # kappa_found = result["allvecs"]
+    kappa_found = result.x
 
     fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(1, 5, sharex=True, sharey=True)
     ax1.tricontourf(
