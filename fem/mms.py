@@ -668,6 +668,10 @@ if __name__ == "__main__":
         norm_min = dataset.clean_fields.min().item()
         norm_max = dataset.clean_fields.max().item()
 
+    else:
+        norm_min = None
+        norm_max = None
+
     # Run the test with the specified parameters
     fem_problem, kappa_true, kappa_recovered, error = run_inverse_problem_test(
         noise_level=args.noise,
