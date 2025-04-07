@@ -149,14 +149,14 @@ def interpolate_samples_torch(
     n_samples = kappa_samples.shape[0]
 
     # Reshape all samples at once into a batch of 2D grids
-    # [n_samples, ny_coarse, nx_coarse]
-    samples_reshaped = kappa_samples.reshape(n_samples, ny_coarse, nx_coarse)
+    # [n_samples, nx_coarse, ny_coarse]
+    samples_reshaped = kappa_samples.reshape(n_samples, nx_coarse, ny_coarse)
 
     # Convert to PyTorch tensor
     samples_tensor = torch.tensor(samples_reshaped, dtype=torch.float32, device=device)
 
     # Add channel dimension required by grid_sample/interpolate
-    # [n_samples, 1, ny_coarse, nx_coarse]
+    # [n_samples, 1, nx_coarse, ny_coarse]
     samples_tensor = samples_tensor.unsqueeze(1)
 
     # Use torch.nn.functional.interpolate for the upsampling
@@ -164,7 +164,7 @@ def interpolate_samples_torch(
     mode = "bicubic" if method == "cubic" else "bilinear"
     samples_fine = F.interpolate(
         samples_tensor,
-        size=(ny_fine, nx_fine),
+        size=(nx_fine, ny_fine),
         mode=mode,
         align_corners=True,
     )
