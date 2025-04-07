@@ -94,7 +94,7 @@ def run_manufactured_solution_test(plot_results=True):
         plt.savefig("figures/boundary_nodes.png")
 
     # Step 3: Define the forcing term at nodes
-    # f(x,y) = 4 + 8(x^2 + y^2)
+    # f(x,y) = -(4 + 8(x^2 + y^2))
     f = -(4 + 8 * (x_coords**2 + y_coords**2))
 
     # Step 4: Define the conductivity field κ(x,y) = 1 + x^2 + y^2
