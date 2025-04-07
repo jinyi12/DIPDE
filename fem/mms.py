@@ -35,6 +35,9 @@ import os
 from scipy.optimize import minimize
 import time
 import argparse
+from models.denoiser import KappaDenoiser
+from dataprep.noisy_kappa_dataset import NoisyKappaFieldDataset
+import torch
 
 # Create figures directory if it doesn't exist
 os.makedirs("figures", exist_ok=True)
@@ -224,6 +227,8 @@ def run_inverse_problem_test(
     regularizer_type=None,  # New parameter for regularizer type (None, 'value', 'gradient', 'tv')
     lambda_reg=0.0,  # Regularization strength
     p_norm=2,  # p value for Lp norm
+    norm_min=None,
+    norm_max=None,
 ):
     """
     Run an inverse problem test using the method of manufactured solutions.
@@ -243,19 +248,23 @@ def run_inverse_problem_test(
     """
     print("\n" + "=" * 80)
     print("INVERSE PROBLEM TEST WITH METHOD OF MANUFACTURED SOLUTIONS")
-    if regularizer_type:
-        print(
-            f"Using {regularizer_type} regularization with λ={lambda_reg}, p={p_norm}"
-        )
-    print("=" * 80)
 
-    # Import regularizer classes if needed
+    # Import regularizer classes when regularizer_type is not None
     if regularizer_type:
         from fem.regularizers import (
             ValueRegularizer,
             GradientRegularizer,
             TotalVariationRegularizer,
+            DenoiserRegularizer,
         )
+
+    if regularizer_type is not None and regularizer_type != "denoiser":
+        print(
+            f"Using {regularizer_type} regularization with λ={lambda_reg}, p={p_norm}"
+        )
+    elif regularizer_type == "denoiser":
+        print(f"Using denoiser regularization with λ={lambda_reg}")
+    print("=" * 80)
 
     # Step 1: Create FEM problem on unit square mesh
     num_pixels = resolution  # Number of elements in each direction
@@ -323,6 +332,20 @@ def run_inverse_problem_test(
         dx = fem_problem.dx
         dy = fem_problem.dy
         regularizer = TotalVariationRegularizer(lambda_reg=lambda_reg, dx=dx, dy=dy)
+    elif regularizer_type == "denoiser":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        denoiser = KappaDenoiser()
+        denoiser.load_state_dict(
+            torch.load("/home/jy384/projects/DIPDE/kappa_denoiser_stoch.pt")
+        )
+        denoiser.to(device)
+        regularizer = DenoiserRegularizer(
+            denoiser=denoiser,
+            lambda_reg=lambda_reg,
+            device=device,
+            norm_min=norm_min,
+            norm_max=norm_max,
+        )
 
     # Attach the regularizer to the FEM problem
     fem_problem.regularizer = regularizer
@@ -333,7 +356,9 @@ def run_inverse_problem_test(
     # kappa0[kappa0 < 0] = 0  # Ensure positivity
     kappa0 = kappa_true.copy()
     kappa0 += 1 * np.random.randn(kappa0.size)
-    kappa0[kappa0 < 0] = 0  # Ensure positivity
+    kappa0 = np.maximum(
+        kappa0, 0.2
+    )  # ensure positivity but not right on the lower bound for optimization
 
     print(f"Initial guess: constant kappa = 2.0")
     print(f"True kappa range: [{kappa_true.min():.2f}, {kappa_true.max():.2f}]")
@@ -382,15 +407,23 @@ def run_inverse_problem_test(
 
         return False  # Continue optimization
 
-    # Configure optimization
+    # # Configure optimization
+    # options = {
+    #     "maxiter": 100,  # Increase maximum iterations if needed.
+    #     # "factr": 1e2,  # Lower factr to tighten the stopping criterion.
+    #     "gtol": 1e-12,  # Optional: adjust the projected gradient tolerance if necessary.
+    #     "ftol": 1e-12,  # Optional: adjust the function tolerance if necessary.
+    #     # "norm": 2,
+    #     "return_all": True,
+    #     "disp": True,
+    # }
     options = {
-        "maxiter": 1000,  # Increase maximum iterations if needed.
-        # "factr": 1e2,  # Lower factr to tighten the stopping criterion.
-        "gtol": 1e-12,  # Optional: adjust the projected gradient tolerance if necessary.
-        "ftol": 1e-12,  # Optional: adjust the function tolerance if necessary.
-        # "norm": 2,
-        "return_all": True,
+        "maxiter": 100,
         "disp": True,
+        "return_all": True,
+        # "gtol": 1e-3,
+        "c1": 0.001,
+        "c2": 0.9,
     }
 
     # Solve the inverse problem
@@ -400,11 +433,12 @@ def run_inverse_problem_test(
     result = minimize(
         fem_problem.objective,
         kappa0.copy(),
-        method="L-BFGS-B",
+        # method="L-BFGS-B",
+        method="BFGS",
         jac=fem_problem.gradient,
         callback=callback,
         options=options,
-        bounds=[(0.1, None) for _ in range(kappa_true.size)],  # Ensure positivity
+        bounds=[(1e-6, None) for _ in range(kappa_true.size)],  # Relaxed lower bound
     )
 
     end_time = time.perf_counter()
@@ -569,7 +603,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--regularizer",
         type=str,
-        choices=["none", "value", "gradient", "tv"],
+        choices=["none", "value", "gradient", "tv", "denoiser"],
         default="none",
         help="Type of regularizer to use (default: none)",
     )
@@ -589,7 +623,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # test_simple_solution()
+    test_simple_solution()
 
     print("=" * 80)
     print("RUNNING METHOD OF MANUFACTURED SOLUTIONS FOR FORWARD PROBLEM...")
@@ -613,6 +647,27 @@ if __name__ == "__main__":
     # Convert 'none' to None for regularizer_type
     regularizer_type = None if args.regularizer == "none" else args.regularizer
 
+    # get dataset statistics for normalization if denoiser is used
+    if regularizer_type == "denoiser":
+        import wandb
+        from pathlib import Path
+
+        wandb_run = wandb.init(project="DIPDE", entity="ECE689AdvDL", config=vars(args))
+        artifact = wandb.use_artifact(
+            "ECE689AdvDL/DIPDE/kappa_field_pair-32x32-to-256x256:latest"
+        )
+        # Get the directory where artifact files are downloaded
+        artifact_dir = Path(artifact.download())
+        # Construct the path to the specific file within the artifact directory
+        actual_data_path = artifact_dir / "kappa_fine_samples.npy"
+
+        dataset = NoisyKappaFieldDataset(
+            data_path=actual_data_path,
+            reshape_size=(args.resolution, args.resolution),
+        )
+        norm_min = dataset.clean_fields.min().item()
+        norm_max = dataset.clean_fields.max().item()
+
     # Run the test with the specified parameters
     fem_problem, kappa_true, kappa_recovered, error = run_inverse_problem_test(
         noise_level=args.noise,
@@ -621,6 +676,8 @@ if __name__ == "__main__":
         regularizer_type=regularizer_type,
         lambda_reg=args.lambda_reg,
         p_norm=args.p,
+        norm_min=norm_min,
+        norm_max=norm_max,
     )
 
     print("\n" + "=" * 80)

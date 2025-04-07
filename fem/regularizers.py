@@ -192,15 +192,30 @@ class TotalVariationRegularizer(Regularizer):
 class DenoiserRegularizer(Regularizer):
     """Neural network denoiser-based regularizer (RED): λ/2 x^T(x - f(x)) for f(x) = denoiser(x)"""
 
-    def __init__(self, denoiser: nn.Module, lambda_reg: float, device: str = "cpu"):
+    def __init__(
+        self,
+        denoiser: nn.Module,
+        lambda_reg: float,
+        device: str = "cpu",
+        norm_min: float = None,
+        norm_max: float = None,
+    ):
         self.denoiser = denoiser
         self.lambda_reg = lambda_reg
         self.device = device
         self.denoiser.eval()  # Ensure denoiser is in evaluation mode
+        self.norm_min = norm_min
+        self.norm_max = norm_max
 
     def __call__(self, kappa: npt.NDArray[np.float64]) -> float:
         with torch.no_grad():
             kappa_torch = torch.from_numpy(kappa).float().to(self.device)
+            # normalize kappa to [0, 1]
+            kappa_torch = (kappa_torch - self.norm_min) / (
+                self.norm_max - self.norm_min
+            )
+            # require gradient for denoiser
+            kappa_torch.requires_grad_(True)
             if kappa_torch.ndim == 1:
                 side = int(np.sqrt(len(kappa)))
                 kappa_2d = kappa_torch.reshape(1, 1, side, side)
@@ -214,15 +229,26 @@ class DenoiserRegularizer(Regularizer):
             else:
                 kappa_2d = kappa_torch
 
-            denoised = self.denoiser(kappa_2d).squeeze(0).squeeze(0).cpu().numpy()
+            denoised = (
+                self.denoiser(kappa_2d).squeeze(0).squeeze(0).cpu().numpy()
+            )  # shape (H, W)
+
+            # denormalize denoised
+            denoised = denoised * (self.norm_max - self.norm_min) + self.norm_min
+
+            denoised = denoised.reshape(-1)
             # Energy: λ/2 x^T (x - f(x))
-            energy = 0.5 * self.lambda_reg * np.sum(kappa * (kappa - denoised))
+            energy = 0.5 * self.lambda_reg * (kappa @ (kappa - denoised))
         return energy
 
     def gradient(self, kappa: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
         # Revised gradient computation using autograd to correctly differentiate the energy
         kappa_torch = torch.from_numpy(kappa).float().to(self.device)
         kappa_torch.requires_grad_(True)
+
+        # normalize kappa to [0, 1]
+        kappa_torch = (kappa_torch - self.norm_min) / (self.norm_max - self.norm_min)
+
         if kappa_torch.ndim == 1:
             side = int(np.sqrt(len(kappa)))
             kappa_2d = kappa_torch.reshape(1, 1, side, side)
@@ -233,7 +259,12 @@ class DenoiserRegularizer(Regularizer):
         else:
             kappa_2d = kappa_torch
         # Compute denoiser output with gradient tracking
-        denoised = self.denoiser(kappa_2d).squeeze(0).squeeze(0)
+        denoised = self.denoiser(kappa_2d).squeeze(0).squeeze(0)  # shape (H, W)
+        denoised = denoised.reshape(-1)
+
+        # denormalize denoised
+        denoised = denoised * (self.norm_max - self.norm_min) + self.norm_min
+
         # analytical RED gradient (x - f(x))
         grad = kappa_torch - denoised
-        return grad.cpu().numpy()
+        return grad.detach().cpu().numpy()
