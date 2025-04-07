@@ -32,6 +32,7 @@ class FEMProblem:
         apply_dirichlet_on="boundary",
         rtol=1e-5,
         atol=0.0,
+        regularizer=None,
     ):
         self.atol = atol
         self.rtol = rtol
@@ -69,6 +70,7 @@ class FEMProblem:
         self._set_ij()
         self.Ka = None
         self.Kd = None
+        self.regularizer = regularizer
 
     def _set_ij(self):
         I = np.expand_dims(self.connectivity, axis=0)
@@ -111,23 +113,19 @@ class FEMProblem:
         f: npt.NDArray[np.float64],
         u_d: npt.NDArray[np.float64],
     ) -> tuple[npt.NDArray[np.float64] : npt.NDArray[np.float64]]:
-        # kappa_d = kappa[self.dirichlet_nodes_bool]
-        # kappa_a = kappa[self.active_nodes_bool]
-        if(True):
-            k_data = (self.Kprime_submatrix.reshape(-1, 1) * kappa.reshape(1, -1)).flatten()
-            K = sparse.csr_array(
-                (k_data, (self.I, self.J)), shape=(self.num_nodes, self.num_nodes)
-            )
-            K.sum_duplicates()
-            # cut out boundary nodes
-            self.Kd = K[self.active_nodes_bool,:][:,self.dirichlet_nodes_bool]
-            f_prob = f[self.active_nodes_bool] - self.Kd @ u_d[self.dirichlet_nodes_bool]
-            self.Ka = K[self.active_nodes_bool, :][:, self.active_nodes_bool]
-            
-            f_prob = f_prob[self.active_nodes_bool]
-            return self.Ka, f_prob
-        else:
-            pass
+        k_data = (self.Kprime_submatrix.reshape(-1, 1) * kappa.reshape(1, -1)).flatten()
+        K = sparse.csr_array(
+            (k_data, (self.I, self.J)), shape=(self.num_nodes, self.num_nodes)
+        )
+        K.sum_duplicates()
+        # cut out boundary nodes
+        u_d = u_d * self.dirichlet_nodes_bool
+        f_prob = f.copy() - K @ u_d
+        K = K[self.active_nodes_bool, :]
+        K = K[:, self.active_nodes_bool]
+        f_prob = f_prob[self.active_nodes_bool]
+        return K, f_prob
+
     """
     Solve forward problem, adjoint problem, and take gradient of \|u0-u_kappa\|^2 w.r.t. kappa.
 
@@ -194,7 +192,9 @@ class FEMProblem:
         assert not f is None, "f must be set with set_parameters()"
         assert not u_d is None, "u_d must be set with set_parameters()"
         K, f = self.make_stiffness_and_bcs(kappa, f, u_d)
-        u_kappa, info = sparse.linalg.lgmres(K, f, rtol=self.rtol, atol=self.atol, x0=u0)
+        u_kappa, info = sparse.linalg.lgmres(
+            K, f, rtol=self.rtol, atol=self.atol, x0=u0
+        )
         # Add back boundary nodes
         u_kappa_ = np.zeros_like(u_d)
         u_kappa_[self.dirichlet_nodes_bool] = u_d[self.dirichlet_nodes_bool]
@@ -206,7 +206,15 @@ class FEMProblem:
 
     def objective(self, kappa: npt.NDArray[np.float64]):
         u_kappa_ = self.forward(kappa)
-        return 0.5 * np.sum((u_kappa_ - self.uhat) ** 2)
+        # Data misfit term
+        misfit = 0.5 * np.sum((u_kappa_ - self.uhat) ** 2)
+
+        # Add regularization term if provided
+        if self.regularizer is not None:
+            reg_term = self.regularizer(kappa)
+            return misfit + reg_term
+
+        return misfit
 
     """ Evaluates gradient of objective, calling inverse_step """
 
@@ -215,6 +223,12 @@ class FEMProblem:
         u_kappa_, dJ, u_kappa, w = self.inverse_step(kappa, self.u0, self.w0)
         self.u0 = u_kappa
         self.w0 = w
+
+        # Add regularization gradient if provided
+        if self.regularizer is not None:
+            reg_grad = self.regularizer.gradient(kappa)
+            return dJ + reg_grad
+
         return dJ
 
 

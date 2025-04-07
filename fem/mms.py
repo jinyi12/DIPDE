@@ -217,30 +217,45 @@ def run_convergence_study():
 
 
 def run_inverse_problem_test(
-    noise_level=0.01, resolution=64, max_iter=100, plot_results=True
+    noise_level=0.01,
+    resolution=64,
+    max_iter=100,
+    plot_results=True,
+    regularizer_type=None,  # New parameter for regularizer type (None, 'value', 'gradient', 'tv')
+    lambda_reg=0.0,  # Regularization strength
+    p_norm=2,  # p value for Lp norm
 ):
     """
     Run an inverse problem test using the method of manufactured solutions.
 
-    This test attempts to recover a known conductivity field from synthetic measurements:
-    1. Define a true conductivity field κ(x,y) = 1 + x^2 + y^2
-    2. Generate synthetic measurements u_true by solving the forward problem
-    3. Add optional measurement noise to create u_meas
-    4. Start with an initial guess κ₀ (constant or random field)
-    5. Solve the inverse problem to recover κ from u_meas
-    6. Compare the recovered κ with the true κ
+    This test attempts to recover a known conductivity field from synthetic measurements.
 
     Args:
-        noise_level: Standard deviation of Gaussian noise to add to measurements (relative to u_true)
-        resolution: Number of elements in each direction (resolution × resolution mesh)
+        noise_level: Standard deviation of Gaussian noise to add to measurements
+        resolution: Number of elements in each direction
         plot_results: Whether to plot and save figures
+        regularizer_type: Type of regularizer to use (None, 'value', 'gradient', 'tv')
+        lambda_reg: Regularization strength parameter
+        p_norm: Power p in the Lp norm for regularization
 
     Returns:
         tuple: (fem_problem, kappa_true, kappa_recovered, error)
     """
     print("\n" + "=" * 80)
     print("INVERSE PROBLEM TEST WITH METHOD OF MANUFACTURED SOLUTIONS")
+    if regularizer_type:
+        print(
+            f"Using {regularizer_type} regularization with λ={lambda_reg}, p={p_norm}"
+        )
     print("=" * 80)
+
+    # Import regularizer classes if needed
+    if regularizer_type:
+        from fem.regularizers import (
+            ValueRegularizer,
+            GradientRegularizer,
+            TotalVariationRegularizer,
+        )
 
     # Step 1: Create FEM problem on unit square mesh
     num_pixels = resolution  # Number of elements in each direction
@@ -294,6 +309,24 @@ def run_inverse_problem_test(
     # Set the measured data as the target for inversion
     fem_problem.set_parameters(f=f, u_d=u_d, uhat=u_meas)
 
+    # Create the appropriate regularizer based on the specified type
+    regularizer = None
+    if regularizer_type == "value":
+        regularizer = ValueRegularizer(lambda_reg=lambda_reg, p=p_norm)
+    elif regularizer_type == "gradient":
+        # We need dx and dy for gradient regularizer
+        dx = fem_problem.dx
+        dy = fem_problem.dy
+        regularizer = GradientRegularizer(lambda_reg=lambda_reg, dx=dx, dy=dy, p=p_norm)
+    elif regularizer_type == "tv":
+        # We need dx and dy for total variation regularizer
+        dx = fem_problem.dx
+        dy = fem_problem.dy
+        regularizer = TotalVariationRegularizer(lambda_reg=lambda_reg, dx=dx, dy=dy)
+
+    # Attach the regularizer to the FEM problem
+    fem_problem.regularizer = regularizer
+
     # Create an initial guess for kappa
     # kappa0 = np.full_like(kappa_true, 5)
     # kappa0 += 10 * np.random.randn(kappa0.size)
@@ -318,17 +351,35 @@ def run_inverse_problem_test(
         # Current kappa
         kappa_current = xk
 
+        # previous objective definition, right now it combines misfit and regularization
+        # objective = fem_problem.objective(kappa_current)
+
         # Objective value (misfit)
-        objective = fem_problem.objective(kappa_current)
+        misfit = 0.5 * np.sum(
+            (fem_problem.forward(kappa_current) - fem_problem.uhat) ** 2
+        )
+        reg_value = 0.0
+        if regularizer:
+            reg_value = regularizer(kappa_current)
+
+        objective = misfit + reg_value
         objectives.append(objective)
 
         # Error in kappa
         error = np.linalg.norm(kappa_current - kappa_true) / np.linalg.norm(kappa_true)
         kappa_errors.append(error)
 
-        print(
-            f"Iteration {iter_num}: objective = {objective:.6e}, relative error in kappa = {error:.6e}"
-        )
+        if regularizer:
+            print(
+                f"Iteration {iter_num}: misfit = {misfit:.6e}, reg = {reg_value:.6e}, "
+                f"objective = {objective:.6e}, relative error in kappa = {error:.6e}"
+            )
+        else:
+            print(
+                f"Iteration {iter_num}: objective = {objective:.6e}, "
+                f"relative error in kappa = {error:.6e}"
+            )
+
         return False  # Continue optimization
 
     # Configure optimization
@@ -433,6 +484,11 @@ def run_inverse_problem_test(
         plt.tight_layout()
         plt.savefig("figures/inverse_problem_convergence.png")
 
+    # Report final regularization value in results
+    if regularizer:
+        final_reg = regularizer(kappa_recovered)
+        print(f"Final regularization value: {final_reg:.6e}")
+
     return fem_problem, kappa_true, kappa_recovered, rel_error
 
 
@@ -473,6 +529,8 @@ def test_simple_solution():
     u_exact = np.ones(fem_problem.num_nodes)
     u_d = np.zeros_like(u_exact)
     u_d[fem_problem.dirichlet_nodes] = u_exact[fem_problem.dirichlet_nodes]
+    print("Number of dirichlet nodes: ", len(fem_problem.dirichlet_nodes))
+    print("Number of active nodes: ", np.sum(fem_problem.active_nodes_bool))
     f = np.zeros_like(u_exact)  # No forcing for constant solution
 
     elem_coords = fem_problem.mesh.get_element_coordinates(
@@ -484,6 +542,7 @@ def test_simple_solution():
     kappa = np.ones_like(x_elem)  # Constant conductivity
 
     fem_problem.set_parameters(f=f, u_d=u_d)
+    print(f"kappa shape: {kappa.shape}")
     u_computed = fem_problem.forward(kappa)
 
     error = np.linalg.norm(u_computed - u_exact) / np.linalg.norm(u_exact)
@@ -506,9 +565,31 @@ if __name__ == "__main__":
     )
     parser.add_argument("--noplot", action="store_true", help="Disable plotting")
 
+    # Add regularization parameters
+    parser.add_argument(
+        "--regularizer",
+        type=str,
+        choices=["none", "value", "gradient", "tv"],
+        default="none",
+        help="Type of regularizer to use (default: none)",
+    )
+    parser.add_argument(
+        "--lambda",
+        dest="lambda_reg",
+        type=float,
+        default=0.0,
+        help="Regularization strength parameter (default: 0.0)",
+    )
+    parser.add_argument(
+        "--p",
+        type=float,
+        default=2.0,
+        help="Power p in Lp norm regularization (default: 2.0)",
+    )
+
     args = parser.parse_args()
 
-    test_simple_solution()
+    # test_simple_solution()
 
     print("=" * 80)
     print("RUNNING METHOD OF MANUFACTURED SOLUTIONS FOR FORWARD PROBLEM...")
@@ -529,9 +610,17 @@ if __name__ == "__main__":
     print(f"Noise level: {args.noise:.2%}")
     print(f"Plotting: {'disabled' if args.noplot else 'enabled'}")
 
-    # Run the test with the specified noise level
+    # Convert 'none' to None for regularizer_type
+    regularizer_type = None if args.regularizer == "none" else args.regularizer
+
+    # Run the test with the specified parameters
     fem_problem, kappa_true, kappa_recovered, error = run_inverse_problem_test(
-        noise_level=args.noise, resolution=args.resolution, plot_results=not args.noplot
+        noise_level=args.noise,
+        resolution=args.resolution,
+        plot_results=not args.noplot,
+        regularizer_type=regularizer_type,
+        lambda_reg=args.lambda_reg,
+        p_norm=args.p,
     )
 
     print("\n" + "=" * 80)
