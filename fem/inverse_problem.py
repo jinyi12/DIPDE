@@ -9,7 +9,7 @@ import numpy.typing as npt
 from scipy import sparse
 from .mesh import Mesh
 from scipy.optimize import minimize, OptimizeResult
-
+from scipy.sparse.linalg import LinearOperator
 
 class FEMProblem:
     """
@@ -36,7 +36,6 @@ class FEMProblem:
     ):
         self.atol = atol
         self.rtol = rtol
-        self.f = f
         self.u_d = u_d
         self.uhat = uhat
         self.u0 = u0
@@ -48,6 +47,8 @@ class FEMProblem:
         self.num_elements = self.mesh.num_elements
         self.num_nodes = self.mesh.num_nodes
         self.connectivity = self.mesh.connectivity
+        if(not f is None):
+            self._calculate_forcing(f)
         if apply_dirichlet_on == "boundary":
             self.dirichlet_nodes = self.mesh.boundary_nodes
         elif apply_dirichlet_on == None:
@@ -57,13 +58,14 @@ class FEMProblem:
         self.dirichlet_nodes_bool = np.zeros(self.num_nodes, dtype=bool)
         self.dirichlet_nodes_bool[self.dirichlet_nodes] = True
         self.active_nodes_bool = np.logical_not(self.dirichlet_nodes_bool)
+        self.active_nodes = np.where(self.active_nodes_bool)[0]
+        self.num_active_nodes = np.sum(self.active_nodes_bool)
         # self.Kprime_submatrix = np.array(
         #     [[4, -1, -2, -1], [-1, 4, -1, -2], [-2, -1, 4, -1], [-1, -2, -1, 4]],
         #     dtype=float,
         # )
         # For a uniform square mesh, self.dx = self.dy = h, so we introduce a factor 1/(6h^2)
-        scale = 1.0 / (6 * self.dx**2)
-        self.Kprime_submatrix = scale * np.array(
+        self.Kprime_submatrix = (1.0/6.0) * np.array(
             [[4, -1, -2, -1], [-1, 4, -1, -2], [-2, -1, 4, -1], [-1, -2, -1, 4]],
             dtype=float,
         )
@@ -81,7 +83,47 @@ class FEMProblem:
         J = J.flatten()
         self.I = I
         self.J = J
+        
+        reduced_map = np.zeros(self.num_nodes, dtype=int)
+        for i, node in enumerate(self.active_nodes):
+            reduced_map[node] = i
+        for i, node in enumerate(self.dirichlet_nodes):
+            reduced_map[node] = i
+        self.active_IJ_mask = self.active_nodes_bool[I] * \
+            self.active_nodes_bool[J]
+        self.dirichlet_IJ_mask = self.active_nodes_bool[I] * \
+            self.dirichlet_nodes_bool[J]
+        self.Ia = np.array([
+            reduced_map[i] for i in I[self.active_IJ_mask]
+        ])
+        self.Id = np.array([
+            # Somewhat confusingly, this array contains active indices
+            reduced_map[i] for i in I[self.dirichlet_IJ_mask]
+        ])
+        self.Ja = np.array([
+            reduced_map[j] for j in J[self.active_IJ_mask]
+        ])
+        self.Jd = np.array([
+            reduced_map[j] for j in J[self.dirichlet_IJ_mask]
+        ])
+    
+    """ 
+    Calculate f vector from nodal values
+    """
+    def _calculate_forcing(self, f):
+        if callable(f):
+            f_nodal = np.array([f(x) for x in X])
+        else:
+            f_nodal = f
+        self.Mprime_submatrix = (self.dx**2)/(36.0) * np.array(
+            [[4, 2, 1, 2], [2, 4, 2, 1], [1, 2, 4, 2], [2, 1, 2, 4]],
+            dtype=float,
+        )
+        self.f = np.zeros(self.num_nodes)
+        for e in range(self.num_elements):
+            self.f[self.connectivity[:,e]] += self.Mprime_submatrix@f_nodal[self.connectivity[:,e]]
 
+    
     """
     set forcing, Dirichlet boundary conditions and objective u
     
@@ -98,7 +140,8 @@ class FEMProblem:
         uhat: npt.NDArray[np.float64] = None,
         u0: npt.NDArray[np.float64] = None,
     ):
-        self.f = f if not f is None else self.f
+        if(not f is None):
+            self._calculate_forcing(f)
         self.u_d = u_d if not u_d is None else self.u_d
         self.uhat = uhat if not uhat is None else self.uhat
         self.u0 = u0 if not u0 is None else self.u0
@@ -113,18 +156,31 @@ class FEMProblem:
         f: npt.NDArray[np.float64],
         u_d: npt.NDArray[np.float64],
     ) -> tuple[npt.NDArray[np.float64] : npt.NDArray[np.float64]]:
-        k_data = (self.Kprime_submatrix.reshape(-1, 1) * kappa.reshape(1, -1)).flatten()
-        K = sparse.csr_array(
-            (k_data, (self.I, self.J)), shape=(self.num_nodes, self.num_nodes)
+        # k_data = (self.Kprime_submatrix.reshape(-1, 1) * kappa.reshape(1, -1)).flatten()
+        # K = sparse.csr_array(
+        #     (k_data, (self.I, self.J)), shape=(self.num_nodes, self.num_nodes)
+        # )
+        # K.sum_duplicates()
+        # # cut out boundary nodes
+        # u_d = u_d * self.dirichlet_nodes_bool
+        # f_prob = f.copy() - K @ u_d
+        # K = K[self.active_nodes_bool, :]
+        # K = K[:, self.active_nodes_bool]
+        # f_prob = f_prob[self.active_nodes_bool]
+        # return K, f_prob
+        k_data = (self.Kprime_submatrix.reshape(-1, 1)
+                  * kappa.reshape(1, -1)).flatten()
+        k_data_a = k_data[self.active_IJ_mask]
+        k_data_d = k_data[self.dirichlet_IJ_mask]
+        self.Ka = sparse.csr_array(
+            (k_data_a, (self.Ia, self.Ja)), shape=(self.num_active_nodes, self.num_active_nodes)
         )
-        K.sum_duplicates()
-        # cut out boundary nodes
-        u_d = u_d * self.dirichlet_nodes_bool
-        f_prob = f.copy() - K @ u_d
-        K = K[self.active_nodes_bool, :]
-        K = K[:, self.active_nodes_bool]
-        f_prob = f_prob[self.active_nodes_bool]
-        return K, f_prob
+        self.Kd = sparse.csr_array(
+            (k_data_d, (self.Id, self.Jd)), shape=(self.num_active_nodes, self.num_nodes-self.num_active_nodes)
+        )
+        f_prob = f[self.active_nodes_bool] - self.Kd @ u_d[self.dirichlet_nodes_bool]
+        return self.Ka, f_prob
+
 
     """
     Solve forward problem, adjoint problem, and take gradient of \|u0-u_kappa\|^2 w.r.t. kappa.
@@ -146,10 +202,14 @@ class FEMProblem:
         assert not u_d is None, "u_d must be set with set_parameters()"
         assert not uhat is None, "uhat must be set with set_parameters()"
         K, f = self.make_stiffness_and_bcs(kappa, f, u_d)
+        D_inv = 1.0 / K.diagonal()
+        def jacobi_preconditioner(v):
+            return D_inv * v
+        M = LinearOperator(K.shape, matvec=jacobi_preconditioner)
         uhat = uhat[self.active_nodes_bool]
         # solve forward problem
         u_kappa, info1 = sparse.linalg.lgmres(
-            K, f, x0=u0, rtol=self.rtol, atol=self.atol
+            K, f, x0=u0, rtol=self.rtol, atol=self.atol, M=M
         )
         # u_kappa, info1 = sparse.linalg.lgmres(K, f, rtol=self.rtol, atol=self.atol)
         if info1 > 0:
@@ -158,7 +218,7 @@ class FEMProblem:
             print("Illegal input or breakdown in forward solver.")
         # solve adjoint problem
         w, info2 = sparse.linalg.lgmres(
-            K.T, uhat - u_kappa, rtol=self.rtol, atol=self.atol
+            K.T, uhat - u_kappa, rtol=self.rtol, atol=self.atol, M=M
         )
         if info2 > 0:
             print("Result of adjoint solver did not converge to tolerance")
@@ -192,8 +252,12 @@ class FEMProblem:
         assert not f is None, "f must be set with set_parameters()"
         assert not u_d is None, "u_d must be set with set_parameters()"
         K, f = self.make_stiffness_and_bcs(kappa, f, u_d)
+        D_inv = 1.0 / K.diagonal()
+        def jacobi_preconditioner(v):
+            return D_inv * v
+        M = LinearOperator(K.shape, matvec=jacobi_preconditioner)
         u_kappa, info = sparse.linalg.lgmres(
-            K, f, rtol=self.rtol, atol=self.atol, x0=u0
+            K, f, rtol=self.rtol, atol=self.atol, x0=u0, M=M
         )
         # Add back boundary nodes
         u_kappa_ = np.zeros_like(u_d)
@@ -247,7 +311,7 @@ def verify_gradient(
     u_kappa, dJ, _, _ = fem_problem.inverse_step(kappa)
     J0 = 0.5 * np.sum((u_kappa - uhat) ** 2)
     if dirs == None:
-        # chose 10 random unissst directions
+        # chose 10 random unit directions
         dirs = np.random.randn(10, kappa.size)
         dirs = dirs / np.linalg.norm(dirs, axis=1).reshape(-1, 1)
     if isinstance(epsilon, (list, np.ndarray)):
@@ -276,11 +340,11 @@ def verify_gradient(
 def test_gradient_1():
     import matplotlib.pyplot as plt
 
-    fem_problem = FEMProblem(64, rtol=1e-9)
+    fem_problem = FEMProblem(64, rtol=1e-12, atol=0.0)
 
     u_d = np.zeros(fem_problem.num_nodes)
     node_coords = fem_problem.mesh.coordinates
-    f = node_coords[0, :] ** 2 + node_coords[1, :] ** 2
+    f = 500*(node_coords[0, :] ** 2 + node_coords[1, :] ** 2)
     elem_coords = fem_problem.mesh.get_element_coordinates(
         np.arange(fem_problem.num_elements)[:]
     )
@@ -357,7 +421,7 @@ def example_inverse_problem():
 
     # problem setup is the same as test_gradient_1
 
-    fem_problem = FEMProblem(128, rtol=1e-9)
+    fem_problem = FEMProblem(64, rtol=1e-9)
 
     # u_d = np.zeros(fem_problem.num_nodes)
     # node_coords = fem_problem.mesh.coordinates
@@ -435,6 +499,7 @@ def example_inverse_problem():
             break
 
     end_time = time.perf_counter()
+    print(f"Optimization took {(end_time-start_time):.4f} s.")
     # kappa_vals = returned["allvecs"]
     # kappa_found = returned["x"]
 
