@@ -112,7 +112,7 @@ class FEMProblem:
     """
     def _calculate_forcing(self, f):
         if callable(f):
-            f_nodal = np.array([f(x) for x in X])
+            f_nodal = np.array([f(x) for x in self.mesh.coordinates])
         else:
             f_nodal = f
         self.Mprime_submatrix = (self.dx**2)/(36.0) * np.array(
