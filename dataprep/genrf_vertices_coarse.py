@@ -447,6 +447,12 @@ def parse_arguments():
         default=1e-3,
         help="Error threshold for KL decomposition",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility. Default is None (use system entropy).",
+    )
 
     return parser.parse_args()
 
@@ -459,7 +465,7 @@ if __name__ == "__main__":
     default_lc = default_lx / 5  # correlation length
     default_nx = 32
     default_ny = 32
-    default_mu_target = 2.7  # conductivity of 17 W/mK
+    default_mu_target = 2.7  # conductivity of 2.7 W/mK
     default_sigma_target = 0.3
     default_output_folder = "randomfield"
     default_error_threshold = 1e-3
@@ -476,6 +482,7 @@ if __name__ == "__main__":
         sigma_target = args.sigma
         output_folder = args.output
         error_threshold = args.error_threshold
+        seed = args.seed
     except:
         # Use defaults if argument parsing fails
         n_samples = default_n_samples
@@ -488,6 +495,14 @@ if __name__ == "__main__":
         sigma_target = default_sigma_target
         output_folder = default_output_folder
         error_threshold = default_error_threshold
+        seed = None
+
+    # Set random seed if provided
+    if seed is not None:
+        np.random.seed(seed)
+        print(f"Random seed set to: {seed}")
+    else:
+        print("Using system entropy for random seed")
 
     # compute correlation length, correlation length must be >= 4 * discretization length, here we use 8 * discretization length
     lc = 8 * lx / nx

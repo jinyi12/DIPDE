@@ -43,6 +43,27 @@ import torch
 os.makedirs("figures", exist_ok=True)
 
 
+class ProximalOperator:
+    def __init__(self, kappa_intermediate, fem_problem, step_size=0.01):
+        self.kappa_intermediate = kappa_intermediate
+        self.fem_problem = fem_problem
+        self.step_size = step_size
+
+    def proximal_objective(self, kappa):
+        solution_misfit = self.fem_problem.objective(kappa)  # proximal regularization
+        kappa_misfit = 0.5 * np.sum((kappa - self.kappa_intermediate) ** 2)
+        return kappa_misfit + self.step_size * solution_misfit
+
+    def proximal_gradient(self, kappa):
+        misfit_grad = self.fem_problem.gradient(
+            kappa
+        )  # the regularization for the proximal
+        kappa_misfit_grad = (
+            kappa - self.kappa_intermediate
+        )  # \frac{1}{2} * 2 * (kappa - kappa_intermediate)
+        return kappa_misfit_grad + self.step_size * misfit_grad
+
+
 def run_manufactured_solution_test(plot_results=True):
     """
     Run the method of manufactured solutions test.
@@ -336,7 +357,7 @@ def run_inverse_problem_test(
         device = "cuda" if torch.cuda.is_available() else "cpu"
         denoiser = KappaDenoiser()
         denoiser.load_state_dict(
-            torch.load("/home/jy384/projects/DIPDE/kappa_denoiser_stoch.pt")
+            torch.load("/home/jy384/projects/DIPDE/models/kappa_denoiser_stoch.pt")
         )
         denoiser.to(device)
         regularizer = DenoiserRegularizer(
@@ -347,14 +368,12 @@ def run_inverse_problem_test(
             norm_max=norm_max,
         )
 
-    # Attach the regularizer to the FEM problem
-    fem_problem.regularizer = regularizer
-
     # Create an initial guess for kappa
     # kappa0 = np.full_like(kappa_true, 5)
     # kappa0 += 10 * np.random.randn(kappa0.size)
     # kappa0[kappa0 < 0] = 0  # Ensure positivity
     kappa0 = kappa_true.copy()
+    print("kappa0.shape: ", kappa0.shape)
     kappa0 += 1 * np.random.randn(kappa0.size)
     kappa0 = np.maximum(
         kappa0, 0.2
@@ -370,58 +389,41 @@ def run_inverse_problem_test(
     kappa_errors = []
 
     def callback(xk):
+        """
+        Callback function to monitor progress
+        Args:
+            xk: Current kappa
+        """
         iter_num = len(iterations)
         iterations.append(iter_num)
 
         # Current kappa
         kappa_current = xk
 
-        # previous objective definition, right now it combines misfit and regularization
-        # objective = fem_problem.objective(kappa_current)
+        # Proximal objective value (kappa misfit + solution misfit)
+        kappa_misfit = 0.5 * np.sum((kappa_current - intermediate_kappa) ** 2)
+        # solution_misfit = 0.5 * np.sum(
+        #     (fem_problem.forward(kappa_current) - fem_problem.uhat) ** 2
+        # )
+        solution_misfit = fem_problem.objective(kappa_current)
 
-        # Objective value (misfit)
-        misfit = 0.5 * np.sum(
-            (fem_problem.forward(kappa_current) - fem_problem.uhat) ** 2
-        )
-        reg_value = 0.0
-        if regularizer:
-            reg_value = regularizer(kappa_current)
-
-        objective = misfit + reg_value
-        objectives.append(objective)
+        objective = kappa_misfit + step_size * solution_misfit
 
         # Error in kappa
         error = np.linalg.norm(kappa_current - kappa_true) / np.linalg.norm(kappa_true)
+
+        print(
+            f"Iteration {iter_num}: kappa misfit = {kappa_misfit:.6e}, solution misfit = {solution_misfit:.6e}, "
+            f"proximal objective = {objective:.6e}, relative error in kappa = {error:.6e}"
+        )
+        objectives.append(objective)
         kappa_errors.append(error)
 
-        if regularizer:
-            print(
-                f"Iteration {iter_num}: misfit = {misfit:.6e}, reg = {reg_value:.6e}, "
-                f"objective = {objective:.6e}, relative error in kappa = {error:.6e}"
-            )
-        else:
-            print(
-                f"Iteration {iter_num}: objective = {objective:.6e}, "
-                f"relative error in kappa = {error:.6e}"
-            )
-
-        return False  # Continue optimization
-
-    # # Configure optimization
-    # options = {
-    #     "maxiter": 100,  # Increase maximum iterations if needed.
-    #     # "factr": 1e2,  # Lower factr to tighten the stopping criterion.
-    #     "gtol": 1e-12,  # Optional: adjust the projected gradient tolerance if necessary.
-    #     "ftol": 1e-12,  # Optional: adjust the function tolerance if necessary.
-    #     # "norm": 2,
-    #     "return_all": True,
-    #     "disp": True,
-    # }
     options = {
-        "maxiter": 100,
+        "maxiter": 50,
         "disp": True,
         "return_all": True,
-        # "gtol": 1e-3,
+        # "gtol": 1e-8,
         "c1": 0.001,
         "c2": 0.9,
     }
@@ -430,22 +432,98 @@ def run_inverse_problem_test(
     print("\nSolving inverse problem...")
     start_time = time.perf_counter()
 
-    result = minimize(
-        fem_problem.objective,
-        kappa0.copy(),
-        # method="L-BFGS-B",
-        method="BFGS",
-        jac=fem_problem.gradient,
-        callback=callback,
-        options=options,
-        bounds=[(1e-6, None) for _ in range(kappa_true.size)],  # Relaxed lower bound
-    )
+    # outer loop
+    k_max = 100
+    intermediate_kappa = kappa0.copy()
+    prev_kappa = intermediate_kappa.copy()
+    initial_step_size = 1.0
+    min_step_size = 1e-4
+    step_size = initial_step_size
+    conv_tol = 1e-6
+    # Track objective values for step size adaptation
+    previous_objective = float("inf")
+    objective_history = []
+    patience = 5  # Number of iterations to wait before reducing step size
+    consecutive_increases = 0
+
+    for k in range(k_max):
+        # Apply regularization gradient step
+        reg_gradient = regularizer.gradient(intermediate_kappa)
+        intermediate_kappa = intermediate_kappa - step_size * reg_gradient
+
+        # Create and solve the proximal problem
+        proximal_operator = ProximalOperator(intermediate_kappa, fem_problem, step_size)
+        result = minimize(
+            proximal_operator.proximal_objective,
+            intermediate_kappa,
+            method="BFGS",
+            jac=proximal_operator.proximal_gradient,
+            callback=callback,
+            options=options,
+            bounds=[(1e-6, None) for _ in range(intermediate_kappa.size)],
+        )
+
+        # Update kappa
+        prev_kappa = intermediate_kappa.copy()
+        intermediate_kappa = result.x
+
+        # Get current objective value (last one recorded by callback)
+        current_objective = objectives[-1] if objectives else float("inf")
+        objective_history.append(current_objective)
+
+        # Step size annealing logic
+        if current_objective > previous_objective:
+            consecutive_increases += 1
+            if consecutive_increases >= patience:
+                # Reduce step size when objective increases for multiple iterations
+                step_size = max(step_size * 0.5, min_step_size)
+                print(
+                    f"Reducing step size to {step_size:.6e} due to increasing objective"
+                )
+                consecutive_increases = 0
+        else:
+            consecutive_increases = 0
+
+            # Optional: Increase step size if objective is decreasing substantially
+            if (
+                k > 10
+                and previous_objective - current_objective > 0.1 * previous_objective
+            ):
+                step_size = min(step_size * 1.2, initial_step_size)
+                print(f"Increasing step size to {step_size:.6e} due to good progress")
+
+        previous_objective = current_objective
+
+        # Print iteration summary with current step size
+        print(f"Outer iteration {k + 1}, step_size = {step_size:.6e}")
+
+        # Convergence check
+        if (
+            np.linalg.norm(intermediate_kappa - prev_kappa) / np.linalg.norm(prev_kappa)
+            < conv_tol
+        ):
+            print(f"Convergence achieved at iteration {k}")
+            break
+
+    # Get the recovered conductivity
+    kappa_recovered = intermediate_kappa
+
+    # CG_options = {
+    #     "disp": True,
+    #     "return_all": True,
+    #     "gtol": 1e-8,
+    #     # "maxiter": 100,
+    # }
+    # result = minimize(
+    #     fem_problem.objective,
+    #     kappa0.copy(),
+    #     method="CG",
+    #     callback=callback,
+    #     options=CG_options,
+    # )
 
     end_time = time.perf_counter()
     print(f"Optimization completed in {end_time - start_time:.2f} seconds")
-
-    # Get the recovered conductivity
-    kappa_recovered = result.x
 
     # Compute final error
     rel_error = np.linalg.norm(kappa_recovered - kappa_true) / np.linalg.norm(
@@ -455,8 +533,13 @@ def run_inverse_problem_test(
 
     # Compute forward solution with recovered kappa
     u_recovered = fem_problem.forward(kappa_recovered)
-    u_error = np.linalg.norm(u_recovered - u_true) / np.linalg.norm(u_true)
-    print(f"Relative L2 error in solution u: {u_error:.6e}")
+    u_error_rel = np.linalg.norm(u_recovered - u_true) / np.linalg.norm(u_true)
+    u_error_l2 = np.linalg.norm(u_recovered - u_true)
+    u_error_l2_meas = np.linalg.norm(u_recovered - u_meas)
+    print(f"Relative L2 error in solution u: {u_error_rel:.6e}")
+    print(f"L2 error in solution u: {u_error_l2:.6e}")
+    print(f"L2 error in solution u w/ noise: {u_error_l2_meas:.6e}")
+    print(f"Final objective value: {objectives[-1]:.6e}")
 
     if plot_results:
         # Plot the true kappa, initial guess, and recovered kappa
@@ -495,7 +578,7 @@ def run_inverse_problem_test(
 
         # Recovered solution
         fem_problem.mesh.plot(
-            u_recovered, title=f"Recovered Solution (Error: {u_error:.2%})"
+            u_recovered, title=f"Recovered Solution (Error: {u_error_rel:.2%})"
         )
 
         # Plot convergence
@@ -652,9 +735,14 @@ if __name__ == "__main__":
         import wandb
         from pathlib import Path
 
-        wandb_run = wandb.init(project="DIPDE", entity="ECE689AdvDL", config=vars(args))
+        wandb_run = wandb.init(
+            project="DIPDE",
+            entity="ECE689AdvDL",
+            config=vars(args),
+            job_type="use_artifact",
+        )
         artifact = wandb.use_artifact(
-            "ECE689AdvDL/DIPDE/kappa_field_pair-32x32-to-256x256:latest"
+            "ECE689AdvDL/DIPDE/kappa_field_pair-32x32N-255x255E-train:latest"
         )
         # Get the directory where artifact files are downloaded
         artifact_dir = Path(artifact.download())

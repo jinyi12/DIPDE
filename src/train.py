@@ -51,7 +51,7 @@ def generate_noise(clean, snr_db_min, snr_db_max, device):
     snr_linear = 10 ** (snr_db / 10)
     noise_power = signal_power / snr_linear
     noise = torch.randn_like(clean) * torch.sqrt(noise_power)
-    return noise, snr_db
+    return noise, snr_db.item()
 
 
 # -----------------------------------------------------------------------------
@@ -72,7 +72,6 @@ def visualize_denoising(model, clean_sample, snr_db_min, snr_db_max, device):
         output = model(input_tensor).squeeze().cpu().numpy()
         clean_img = clean_sample.squeeze().cpu().numpy()
         noisy_img = noisy_sample.squeeze().cpu().numpy()
-        snr_db = snr_db.cpu().numpy()
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
         im0 = axes[0].imshow(clean_img, cmap="viridis")
         axes[0].set_title("Clean Field")
@@ -187,7 +186,10 @@ def main():
     wandb_run = None
     if args.is_artifact:
         wandb_run = wandb.init(
-            project=args.wandb_project, entity=args.wandb_entity, config=vars(args)
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            config=vars(args),
+            job_type="train",
         )
 
     # Create a DataLoader using the NoisyKappaFieldDataset with artifact support

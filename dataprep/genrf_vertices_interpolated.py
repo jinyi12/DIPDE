@@ -17,6 +17,8 @@ from pathlib import Path
 import argparse
 from tqdm import tqdm
 import wandb  # Import wandb
+import torch
+import torch.nn.functional as F
 
 
 def load_coarse_data(input_folder: str) -> tuple:
@@ -141,9 +143,6 @@ def interpolate_samples_torch(
     np.ndarray
         Interpolated samples on fine grid
     """
-    import torch
-    import torch.nn.functional as F
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     n_samples = kappa_samples.shape[0]
@@ -174,6 +173,33 @@ def interpolate_samples_torch(
     kappa_fine_samples = samples_fine.squeeze(1).cpu().numpy()
 
     return kappa_fine_samples
+
+
+def convert_nodal_to_element(kappa_nodal, mesh=None):
+    """
+    Convert nodal kappa values to element values.
+
+    Args:
+        kappa_nodal: Tensor of shape [n_samples, 1, H, W] or numpy array
+        mesh: Optional Mesh instance for reference
+
+    Returns:
+        Element-based kappa values
+    """
+    if isinstance(kappa_nodal, torch.Tensor):
+        # PyTorch fast path using average pooling
+        kappa_element = F.avg_pool2d(kappa_nodal, kernel_size=2, stride=1)
+        return kappa_element
+    else:
+        # NumPy implementation [n_samples, n_x, n_y] into [n_samples, numel_x, numel_y]
+        N = kappa_nodal.shape[1] - 1  # or appropriate dimension
+        kappa_element = (
+            kappa_nodal[:, :N, :N]
+            + kappa_nodal[:, 1:, :N]
+            + kappa_nodal[:, :N, 1:]
+            + kappa_nodal[:, 1:, 1:]
+        ) / 4.0
+        return kappa_element
 
 
 def save_interpolated_data(kappa_fine_samples: np.ndarray, output_folder: str) -> Path:
@@ -226,11 +252,11 @@ def plot_comparison(
     kappa_samples : np.ndarray
         Coarse grid samples
     kappa_fine_samples : np.ndarray
-        Fine grid interpolated samples
+        Fine grid interpolated samples (element-based)
     nx_coarse, ny_coarse : int
         Coarse grid dimensions
     nx_fine, ny_fine : int
-        Fine grid dimensions
+        Fine grid dimensions (nodal)
     output_folder : str
         Folder to save plots
     lx, ly : float
@@ -243,16 +269,22 @@ def plot_comparison(
 
     # Reshape samples to 2D grids
     coarse_sample = kappa_samples[sample_idx].reshape(ny_coarse, nx_coarse)
-    fine_sample = kappa_fine_samples[sample_idx].reshape(ny_fine, ny_fine)
+
+    # For the fine sample, we're now using element-based values (nx_fine-1, ny_fine-1)
+    num_elements_x = nx_fine - 1
+    num_elements_y = ny_fine - 1
+    fine_sample = kappa_fine_samples[sample_idx].reshape(num_elements_y, num_elements_x)
 
     # Create meshgrids
     x_coarse = np.linspace(0, lx, nx_coarse)
     y_coarse = np.linspace(0, ly, ny_coarse)
-    x_fine = np.linspace(0, lx, nx_fine)
-    y_fine = np.linspace(0, ly, ny_fine)
 
+    # For elements, use cell centers for plotting
+    x_fine_elem = np.linspace(0, lx, num_elements_x + 1)  # Cell edges
+    y_fine_elem = np.linspace(0, ly, num_elements_y + 1)  # Cell edges
+
+    # Create meshgrids
     X_coarse, Y_coarse = np.meshgrid(x_coarse, y_coarse)
-    X_fine, Y_fine = np.meshgrid(x_fine, y_fine)
 
     # Plot comparison
     fig, axes = plt.subplots(
@@ -267,11 +299,11 @@ def plot_comparison(
     axes[0].set_xlabel("X")
     axes[0].set_ylabel("Y")
 
-    # Fine grid
+    # Fine grid - use pcolormesh which accepts cell edges
     im2 = axes[1].pcolormesh(
-        X_fine, Y_fine, fine_sample, shading="auto", cmap="viridis"
+        x_fine_elem, y_fine_elem, fine_sample, shading="auto", cmap="viridis"
     )
-    axes[1].set_title(f"Fine Grid ({nx_fine}x{ny_fine})")
+    axes[1].set_title(f"Fine Grid Elements ({num_elements_x}x{num_elements_y})")
     axes[1].set_xlabel("X")
 
     # Add colorbars
@@ -282,24 +314,51 @@ def plot_comparison(
     plt.savefig(output_path / "grid_comparison.png", dpi=300)
     plt.close(fig)
 
-    # Also create a difference plot
+    # Create a difference plot - for element-based comparison
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    # Interpolate coarse sample to fine grid for direct comparison
-    X_coarse_flat, Y_coarse_flat = X_coarse.flatten(), Y_coarse.flatten()
-    coarse_values = coarse_sample.flatten()
+    # Interpolate coarse sample to fine element grid for direct comparison
+    # First, get the cell centers for both coarse and fine grids
+    x_coarse_centers = (x_coarse[:-1] + x_coarse[1:]) / 2
+    y_coarse_centers = (y_coarse[:-1] + y_coarse[1:]) / 2
+    x_fine_centers = (x_fine_elem[:-1] + x_fine_elem[1:]) / 2
+    y_fine_centers = (y_fine_elem[:-1] + y_fine_elem[1:]) / 2
 
-    # Use griddata for interpolation to match fine grid points
+    X_coarse_centers, Y_coarse_centers = np.meshgrid(x_coarse_centers, y_coarse_centers)
+    X_fine_centers, Y_fine_centers = np.meshgrid(x_fine_centers, y_fine_centers)
+
+    # Reshape coarse sample for element-wise representation if needed
+    if nx_coarse > x_coarse_centers.size:
+        # Convert nodal to element for coarse sample too (if necessary)
+        coarse_element = (
+            coarse_sample[:-1, :-1]
+            + coarse_sample[1:, :-1]
+            + coarse_sample[:-1, 1:]
+            + coarse_sample[1:, 1:]
+        ) / 4.0
+    else:
+        coarse_element = coarse_sample
+
+    # Use griddata for interpolation from coarse element centers to fine element centers
+    coarse_values = coarse_element.flatten()
+    X_coarse_flat, Y_coarse_flat = (
+        X_coarse_centers.flatten(),
+        Y_coarse_centers.flatten(),
+    )
+
     interp_coarse = griddata(
-        (X_coarse_flat, Y_coarse_flat), coarse_values, (X_fine, Y_fine), method="cubic"
+        (X_coarse_flat, Y_coarse_flat),
+        coarse_values,
+        (X_fine_centers, Y_fine_centers),
+        method="cubic",
     )
 
     # Calculate absolute difference
     diff = np.abs(fine_sample - interp_coarse)
 
     # Plot difference
-    im = ax.pcolormesh(X_fine, Y_fine, diff, shading="auto", cmap="hot")
-    ax.set_title("Absolute Difference")
+    im = ax.pcolormesh(x_fine_elem, y_fine_elem, diff, shading="auto", cmap="hot")
+    ax.set_title("Absolute Difference (Element Values)")
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
 
@@ -363,6 +422,13 @@ def parse_arguments():
         default="cubic",
         help="Interpolation method: linear, cubic, etc.",
     )
+    parser.add_argument(
+        "--dataset_type",
+        type=str,
+        default="train",
+        choices=["train", "val", "test"],
+        help="Dataset type: train, val, or test",
+    )
 
     return parser.parse_args()
 
@@ -381,6 +447,7 @@ def main():
         lx = args.lx
         ly = args.ly
         method = args.method
+        dataset_type = args.dataset_type
     except:
         # Default parameters if parsing fails
         input_folder = "randomfield"
@@ -392,14 +459,15 @@ def main():
         lx = 1.0
         ly = 1.0
         method = "cubic"
+        dataset_type = "train"
 
     # Initialize WandB
     run = wandb.init(
         project="DIPDE",
         entity="ECE689AdvDL",
-        job_type="data_upload",  # Use job_type for categorization
-        tags=["upload"],  # Tag the run
-        config={  # Log hyperparameters
+        job_type="data_upload",
+        tags=["upload", dataset_type],  # Add dataset type as a tag
+        config={
             "input_folder": input_folder,
             "output_folder": output_folder,
             "nx_coarse": nx_coarse,
@@ -409,6 +477,7 @@ def main():
             "lx": lx,
             "ly": ly,
             "method": method,
+            "dataset_type": dataset_type,
         },
     )
 
@@ -424,16 +493,30 @@ def main():
         kappa_samples, nx_coarse, ny_coarse, nx_fine, ny_fine, lx, ly, method
     )
 
+    # Convert nodal to element
+    kappa_fine_samples = convert_nodal_to_element(kappa_fine_samples)
+    if isinstance(kappa_fine_samples, torch.Tensor):
+        # [n_samples, 1, numel_x, numel_y]
+        numel_x = kappa_fine_samples.shape[2]
+        numel_y = kappa_fine_samples.shape[3]
+        print(f"Interpolated fine grid has {numel_x}x{numel_y} elements")
+    else:
+        # [n_samples, numel_x, numel_y]
+        numel_x = kappa_fine_samples.shape[1]
+        numel_y = kappa_fine_samples.shape[2]
+        print(f"Interpolated fine grid has {numel_x}x{numel_y} elements")
     # Save interpolated data and get the path
     saved_file_path = save_interpolated_data(kappa_fine_samples, output_folder)
 
-    # Create and log artifact
-    artifact_name = f"kappa_field_pair-{nx_coarse}x{ny_coarse}-to-{nx_fine}x{ny_fine}"  # More descriptive name
+    # Create and log artifact with dataset type
+    artifact_name = (
+        f"kappa_field_pair-{nx_coarse}x{ny_coarse}N-{numel_x}x{numel_y}E-{dataset_type}"
+    )
+
     artifact = wandb.Artifact(
-        name=artifact_name,  # Use the new name
+        name=artifact_name,
         type="dataset",
-        # Updated description to mention both files
-        description=f"Coarse ({nx_coarse}x{ny_coarse}) and interpolated fine ({nx_fine}x{ny_fine}) random field samples.",
+        description=f"{dataset_type.capitalize()} dataset: Coarse ({nx_coarse}x{ny_coarse}) Nodal and interpolated fine ({numel_x}x{numel_y}) Elemental random field samples.",
         metadata=wandb.config.as_dict(),
     )
     # add the saved file (Fine Samples)

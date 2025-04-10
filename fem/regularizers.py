@@ -9,11 +9,14 @@ class Regularizer(ABC):
     """Abstract base class for regularization terms."""
 
     @abstractmethod
-    def __call__(self, kappa: npt.NDArray[np.float64]) -> float:
+    def __call__(
+        self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
+    ) -> float:
         """Calculate regularization value.
 
         Args:
             kappa: Parameter array to regularize
+            lambda_reg: Optional override for regularization strength
 
         Returns:
             Regularization value
@@ -21,16 +24,27 @@ class Regularizer(ABC):
         pass
 
     @abstractmethod
-    def gradient(self, kappa: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    def gradient(
+        self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
+    ) -> npt.NDArray[np.float64]:
         """Calculate gradient of regularization term.
 
         Args:
             kappa: Parameter array to regularize
+            lambda_reg: Optional override for regularization strength
 
         Returns:
             Gradient of regularization with respect to kappa
         """
         pass
+
+    def update_lambda(self, lambda_reg: float) -> None:
+        """Update the regularization strength.
+
+        Args:
+            lambda_reg: New regularization strength
+        """
+        self.lambda_reg = lambda_reg
 
 
 class ValueRegularizer(Regularizer):
@@ -47,11 +61,17 @@ class ValueRegularizer(Regularizer):
         self.lambda_reg = lambda_reg
         self.p = p
 
-    def __call__(self, kappa: npt.NDArray[np.float64]) -> float:
+    def __call__(
+        self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
+    ) -> float:
         """Calculate the Lp norm regularization value."""
+        if lambda_reg is not None:
+            self.lambda_reg = lambda_reg
         return (self.lambda_reg / self.p) * np.sum(np.abs(kappa) ** self.p)
 
-    def gradient(self, kappa: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    def gradient(
+        self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
+    ) -> npt.NDArray[np.float64]:
         """Calculate gradient of the Lp norm regularization.
 
         For Lp norm regularization, the gradient is: λ |κ|^(p-1) sign(κ)
@@ -60,6 +80,8 @@ class ValueRegularizer(Regularizer):
         if self.p == 1:
             return self.lambda_reg * np.sign(kappa)
 
+        if lambda_reg is not None:
+            self.lambda_reg = lambda_reg
         return self.lambda_reg * np.sign(kappa) * np.abs(kappa) ** (self.p - 1)
 
 
@@ -92,8 +114,12 @@ class GradientRegularizer(Regularizer):
         self.p = p
         self.epsilon = epsilon  # To prevent division by zero for p < 2
 
-    def __call__(self, kappa: npt.NDArray[np.float64]) -> float:
+    def __call__(
+        self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
+    ) -> float:
         """Calculate the gradient Lp norm regularization value."""
+        if lambda_reg is not None:
+            self.lambda_reg = lambda_reg
         kappa_2d = kappa.reshape((int(np.sqrt(len(kappa))), -1))
         dx = np.gradient(kappa_2d, axis=0) / self.dx
         dy = np.gradient(kappa_2d, axis=1) / self.dy
@@ -103,12 +129,16 @@ class GradientRegularizer(Regularizer):
 
         return (self.lambda_reg / self.p) * np.sum(grad_magnitude_p)
 
-    def gradient(self, kappa: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    def gradient(
+        self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
+    ) -> npt.NDArray[np.float64]:
         """Calculate gradient of the gradient Lp norm regularization.
 
         For p=2, this is -λ∆κ (negative Laplacian).
         For general p, this is -λ div(|∇κ|^(p-2) ∇κ).
         """
+        if lambda_reg is not None:
+            self.lambda_reg = lambda_reg
         kappa_2d = kappa.reshape((int(np.sqrt(len(kappa))), -1))
         dx = np.gradient(kappa_2d, axis=0) / self.dx
         dy = np.gradient(kappa_2d, axis=1) / self.dy
@@ -158,8 +188,12 @@ class TotalVariationRegularizer(Regularizer):
         self.dy = dy
         self.epsilon = epsilon  # Smoothing parameter
 
-    def __call__(self, kappa: npt.NDArray[np.float64]) -> float:
+    def __call__(
+        self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
+    ) -> float:
         """Calculate the Total Variation regularization value."""
+        if lambda_reg is not None:
+            self.lambda_reg = lambda_reg
         kappa_2d = kappa.reshape((int(np.sqrt(len(kappa))), -1))
         dx = np.gradient(kappa_2d, axis=0) / self.dx
         dy = np.gradient(kappa_2d, axis=1) / self.dy
@@ -167,8 +201,12 @@ class TotalVariationRegularizer(Regularizer):
         # Smoothed TV: ∫√(|∇κ|² + ε) dx
         return self.lambda_reg * np.sum(np.sqrt(dx**2 + dy**2 + self.epsilon))
 
-    def gradient(self, kappa: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    def gradient(
+        self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
+    ) -> npt.NDArray[np.float64]:
         """Calculate gradient of the Total Variation regularization."""
+        if lambda_reg is not None:
+            self.lambda_reg = lambda_reg
         kappa_2d = kappa.reshape((int(np.sqrt(len(kappa))), -1))
         dx = np.gradient(kappa_2d, axis=0) / self.dx
         dy = np.gradient(kappa_2d, axis=1) / self.dy
@@ -207,8 +245,12 @@ class DenoiserRegularizer(Regularizer):
         self.norm_min = norm_min
         self.norm_max = norm_max
 
-    def __call__(self, kappa: npt.NDArray[np.float64]) -> float:
+    def __call__(
+        self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
+    ) -> float:
         with torch.no_grad():
+            if lambda_reg is not None:
+                self.lambda_reg = lambda_reg
             kappa_torch = torch.from_numpy(kappa).float().to(self.device)
             # normalize kappa to [0, 1]
             kappa_torch = (kappa_torch - self.norm_min) / (
@@ -241,8 +283,12 @@ class DenoiserRegularizer(Regularizer):
             energy = 0.5 * self.lambda_reg * (kappa @ (kappa - denoised))
         return energy
 
-    def gradient(self, kappa: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    def gradient(
+        self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
+    ) -> npt.NDArray[np.float64]:
         # Revised gradient computation using autograd to correctly differentiate the energy
+        if lambda_reg is not None:
+            self.lambda_reg = lambda_reg
         kappa_torch = torch.from_numpy(kappa).float().to(self.device)
         kappa_torch.requires_grad_(True)
 
@@ -267,4 +313,4 @@ class DenoiserRegularizer(Regularizer):
 
         # analytical RED gradient (x - f(x))
         grad = kappa_torch - denoised
-        return grad.detach().cpu().numpy()
+        return self.lambda_reg * grad.detach().cpu().numpy()
