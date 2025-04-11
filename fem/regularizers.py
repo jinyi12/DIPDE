@@ -50,39 +50,41 @@ class Regularizer(ABC):
 class ValueRegularizer(Regularizer):
     """Regularizer that penalizes the Lp norm of the parameter values.
 
-    The functional is defined as: R(κ) = (λ/p) ∫|κ|ᵖ dx
-
-    Args:
-        lambda_reg: Regularization strength
-        p: The power in the Lp norm (default: 2)
+    The functional is defined as:
+        R(κ) = (λ/p) ∫ |κ|ᵖ dx
+    and should be discretized as:
+        R(κ) ≈ (λ/p) * ΔA * Σ_i |κ_i|ᵖ,
+    with the gradient:
+        ∇R(κ)_i = λ * ΔA * |κ_i|^(p-1) * sign(κ_i).
     """
 
-    def __init__(self, lambda_reg: float, p: float = 2):
+    def __init__(
+        self, lambda_reg: float, p: float = 2, dx: float = 1.0, dy: float = 1.0
+    ):
         self.lambda_reg = lambda_reg
         self.p = p
+        self.dx = dx
+        self.dy = dy
 
     def __call__(
         self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
     ) -> float:
-        """Calculate the Lp norm regularization value."""
         if lambda_reg is not None:
             self.lambda_reg = lambda_reg
-        return (self.lambda_reg / self.p) * np.sum(np.abs(kappa) ** self.p)
+        cell_area = self.dx * self.dy
+        return (self.lambda_reg / self.p) * np.sum(np.abs(kappa) ** self.p) * cell_area
 
     def gradient(
         self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
     ) -> npt.NDArray[np.float64]:
-        """Calculate gradient of the Lp norm regularization.
-
-        For Lp norm regularization, the gradient is: λ |κ|^(p-1) sign(κ)
-        """
-        # Handle special case of p=1 to avoid numerical issues
-        if self.p == 1:
-            return self.lambda_reg * np.sign(kappa)
-
         if lambda_reg is not None:
             self.lambda_reg = lambda_reg
-        return self.lambda_reg * np.sign(kappa) * np.abs(kappa) ** (self.p - 1)
+        cell_area = self.dx * self.dy
+        if self.p == 1:
+            return self.lambda_reg * np.sign(kappa) * cell_area
+        return (
+            self.lambda_reg * np.sign(kappa) * np.abs(kappa) ** (self.p - 1) * cell_area
+        )
 
 
 class GradientRegularizer(Regularizer):
@@ -204,27 +206,29 @@ class TotalVariationRegularizer(Regularizer):
     def gradient(
         self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
     ) -> npt.NDArray[np.float64]:
-        """Calculate gradient of the Total Variation regularization."""
         if lambda_reg is not None:
             self.lambda_reg = lambda_reg
-        kappa_2d = kappa.reshape((int(np.sqrt(len(kappa))), -1))
-        dx = np.gradient(kappa_2d, axis=0) / self.dx
-        dy = np.gradient(kappa_2d, axis=1) / self.dy
-
-        # Calculate 1/√(|∇κ|² + ε)
-        grad_magnitude = np.sqrt(dx**2 + dy**2 + self.epsilon)
-        weight = 1.0 / grad_magnitude
-
-        # Calculate div(∇κ/|∇κ|)
-        weighted_dx = weight * dx
-        weighted_dy = weight * dy
-
-        div_weighted_grad = (
-            np.gradient(weighted_dx, axis=0) / self.dx
-            + np.gradient(weighted_dy, axis=1) / self.dy
+        # Convert numpy array to torch tensor and enable gradient tracking.
+        kappa_tensor = torch.tensor(
+            kappa.reshape((int(np.sqrt(len(kappa))), -1)),
+            dtype=torch.float32,
+            requires_grad=True,
         )
 
-        return (-self.lambda_reg * div_weighted_grad).flatten()
+        # Compute the total variation regularizer using torch operations:
+        # the finite-difference TV using torch.gradient similar to np.gradient
+        # include multiplication by dx*dy for the integration measure.
+        grad_x = torch.gradient(kappa_tensor, spacing=self.dx)[0] / self.dx
+        grad_y = torch.gradient(kappa_tensor, spacing=self.dy)[1] / self.dy
+        tv = torch.sum(torch.sqrt(grad_x**2 + grad_y**2 + self.epsilon))
+        tv = self.lambda_reg * tv * self.dx * self.dy
+
+        # Trigger the backward pass:
+        tv.backward()
+
+        # Extract the gradient and convert to numpy array:
+        grad_numpy = kappa_tensor.grad.cpu().detach().numpy().flatten()
+        return grad_numpy
 
 
 class DenoiserRegularizer(Regularizer):

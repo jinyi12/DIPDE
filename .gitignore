@@ -14,3 +14,11 @@ wandb/
 *.pkl
 *.pyc
 /__pycache__/*
+results/*
+*nohup.out
+*.out
+*.err
+*.log
+*.log.*
+*.log.*.*
+*.log.*.*.*
