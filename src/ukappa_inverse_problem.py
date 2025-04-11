@@ -19,6 +19,7 @@ from pathlib import Path
 import wandb
 from tqdm import tqdm
 from scipy.optimize import minimize
+import json
 
 from fem.inverse_problem import FEMProblem
 from models.denoiser import KappaDenoiser
@@ -62,7 +63,7 @@ def solve_inverse_problem_for_ukappa(
     true_kappa,
     resolution=64,
     noise_level=0.01,
-    initial_lambda_reg=0.1,
+    initial_lambda_reg=1,
     initial_step_size=1,
     denoiser_path=None,
     norm_min=None,
@@ -73,6 +74,8 @@ def solve_inverse_problem_for_ukappa(
     idx=0,
     regularizer_type="denoiser",
     p_norm=2,
+    lambda_min_factor=0.1,  # Start lambda_reg at this fraction of initial_lambda_reg
+    lambda_schedule_iterations=50,  # Iterations over which lambda increases
 ):
     """
     Solve the inverse problem for a given ukappa solution.
@@ -91,6 +94,8 @@ def solve_inverse_problem_for_ukappa(
         output_dir: Directory to save results
         regularizer_type: Type of regularizer to use (denoiser, value, gradient, tv)
         p_norm: p value for Lp norm when using value or gradient regularizer
+        lambda_min_factor: Initial lambda_reg as a fraction of initial_lambda_reg
+        lambda_schedule_iterations: Number of iterations over which lambda_reg increases
 
     Returns:
         dict: Results including errors and recovered fields
@@ -119,6 +124,9 @@ def solve_inverse_problem_for_ukappa(
 
     # Set the measured data as the target for inversion
     fem_problem.set_parameters(f=f, u_d=u_d, uhat=u_meas)
+
+    # Calculate initial lambda_reg based on minimum factor
+    min_lambda_reg = initial_lambda_reg * lambda_min_factor
 
     # Create the appropriate regularizer based on type
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -173,6 +181,7 @@ def solve_inverse_problem_for_ukappa(
     iterations = []
     objectives = []
     kappa_errors = []
+    reg_values = []  # Track regularization values
 
     def callback(xk):
         """Callback function for the optimizer to track progress"""
@@ -196,7 +205,7 @@ def solve_inverse_problem_for_ukappa(
 
     # Optimization parameters
     options = {
-        "maxiter": 5,
+        "maxiter": 3,
         "disp": True,
         "return_all": True,
         "c1": 0.001,
@@ -213,31 +222,55 @@ def solve_inverse_problem_for_ukappa(
     prev_kappa = intermediate_kappa.copy()
     min_step_size = 1e-4
     step_size = initial_step_size
-    relative_improvement_threshold = 1e-2  # Threshold for slow relative improvement
-    # lambda_reg = initial_lambda_reg
     conv_tol = 1e-6
 
-    # we will half lambda_reg every 10 iterations
-    lambda_reg = initial_lambda_reg
     # Step size adaptation parameters
     previous_objective = float("inf")
-    objective_history = []
-    patience = 5
+    objective_history = []  # Store last few objectives
+    history_window = 3  # Number of iterations to consider for trends
+    patience = 10  # Iterations of increase before decreasing step size
     consecutive_increases = 0
+    decrease_factor = 0.5  # Factor to decrease step size
+    increase_factor = 1.1  # Factor to increase step size
+    max_step_size_multiplier = 1.0  # Max step size relative to initial
+    max_step_size = initial_step_size * max_step_size_multiplier
+
+    # Regularization tracking parameters
+    best_reg_value = float("inf")  # Best regularization value seen so far
+    best_kappa_by_reg = None  # Kappa that gave the best regularization value
 
     for k in range(k_max):
+        # Update lambda_reg according to the schedule (linear decrease)
+        if k < lambda_schedule_iterations:
+            # Linear interpolation: from initial_lambda_reg down to min_lambda_reg
+            progress = k / lambda_schedule_iterations  # 0 to 1
+            current_lambda = initial_lambda_reg - progress * (
+                initial_lambda_reg - min_lambda_reg
+            )
+        else:
+            # After scheduled iterations, use the minimum lambda
+            current_lambda = min_lambda_reg
+
+        # Update regularizer with current lambda
+        regularizer.update_lambda(current_lambda)
+
         # Apply regularization gradient step (without momentum)
         reg_gradient = regularizer.gradient(intermediate_kappa)
         intermediate_kappa = intermediate_kappa - step_size * reg_gradient
         # ensure positivity
         intermediate_kappa = np.maximum(intermediate_kappa, 1e-6)
 
+        # Calculate regularization value for tracking and early stopping
+        # This calculation happens before the proximal step to evaluate the current kappa
+        current_reg_value = regularizer(intermediate_kappa)
+        reg_values.append(current_reg_value)
+
         # Create and solve the proximal problem
         proximal_operator = ProximalOperator(intermediate_kappa, fem_problem, step_size)
         result = minimize(
             proximal_operator.proximal_objective,
             intermediate_kappa,
-            method="BFGS",
+            method="L-BFGS-B",
             jac=proximal_operator.proximal_gradient,
             callback=callback,
             options=options,
@@ -248,53 +281,51 @@ def solve_inverse_problem_for_ukappa(
         prev_kappa = intermediate_kappa.copy()
         intermediate_kappa = result.x
 
-        # Get current objective value
+        # Get current objective value (use the last one from the callback)
         current_objective = objectives[-1] if objectives else float("inf")
+
+        # Update objective history (keep only the last `history_window` values)
         objective_history.append(current_objective)
+        if len(objective_history) > history_window:
+            objective_history.pop(0)
 
-        # Annealing for lambda_reg, minimum lambda_reg is 0.01
-        if (k + 1) % 10 == 0:
-            lambda_reg = max(lambda_reg * 0.5, 0.1)
-            regularizer.update_lambda(lambda_reg)
-            print(f"Reducing lambda to {lambda_reg:.6e}")
-
-        # Refined adaptive step size scheduler
-
-        if previous_objective != float("inf"):
-            relative_improvement = (
-                previous_objective - current_objective
-            ) / previous_objective
-        else:
-            relative_improvement = 0.0
-
+        # --- More Robust Adaptive Step Size Scheduler ---
         if current_objective >= previous_objective:
             consecutive_increases += 1
             if consecutive_increases >= patience:
-                step_size = max(step_size * 0.5, min_step_size)
+                step_size = max(step_size * decrease_factor, min_step_size)
                 print(
-                    f"Reducing step size to {step_size:.6e} after {consecutive_increases} consecutive increases"
+                    f"Objective increased for {patience} steps. Reducing step size to {step_size:.6e}"
                 )
-                consecutive_increases = 0
+                consecutive_increases = 0  # Reset counter after decrease
         else:
+            # Objective decreased, reset consecutive increase counter
             consecutive_increases = 0
-            if k > 10:
-                # If the relative improvement is very small, increase step size more aggressively.
-                if relative_improvement < relative_improvement_threshold:
-                    step_size = min(step_size * 1.5, initial_step_size)
-                    print(
-                        f"Slow improvement detected (relative improvement = {relative_improvement:.2e}): Increasing step size aggressively to {step_size:.6e}"
-                    )
-                # Otherwise, if improvement is decent, increase by a moderate factor.
-                elif (
-                    previous_objective - current_objective
-                ) > 0.1 * previous_objective:
-                    step_size = min(step_size * 1.2, initial_step_size)
-                    print(f"Increasing step size to {step_size:.6e}")
+
+            # Check for consistent decrease to potentially increase step size
+            if len(objective_history) == history_window and k > history_window:
+                # Check if all recent steps showed improvement
+                is_consistently_decreasing = all(
+                    objective_history[i] < objective_history[i - 1]
+                    for i in range(1, history_window)
+                )
+
+                if is_consistently_decreasing:
+                    new_step_size = min(step_size * increase_factor, max_step_size)
+                    if new_step_size > step_size:  # Only print if it actually increased
+                        step_size = new_step_size
+                        print(
+                            f"Consistent decrease observed. Increasing step size to {step_size:.6e}"
+                        )
 
         previous_objective = current_objective
-        print(f"Outer iteration {k + 1}, step_size = {step_size:.6e}")
+        # Update progress reporting
+        print(
+            f"Outer iteration {k + 1}, λ = {current_lambda:.4e}, step_size = {step_size:.4e}, "
+            f"objective = {current_objective:.4e}, reg_value = {current_reg_value:.4e}"
+        )
 
-        # Add this function to create proper visualizations for wandb
+        # function to create proper visualizations for wandb
         def create_field_visualization(field_data, title, cmap="viridis"):
             """Create a matplotlib figure with colorbar for wandb logging"""
             fig, ax = plt.subplots(figsize=(8, 8))
@@ -349,8 +380,15 @@ def solve_inverse_problem_for_ukappa(
             print(f"Convergence achieved at iteration {k}")
             break
 
-    # Get the recovered conductivity
-    kappa_recovered = intermediate_kappa
+    # Get the recovered conductivity (use the one with the best regularization value)
+    if best_kappa_by_reg is not None:
+        kappa_recovered = best_kappa_by_reg
+        print("Using kappa with best regularization value for final result")
+    else:
+        kappa_recovered = intermediate_kappa
+        print(
+            "Using final kappa for result (no improvement in regularization was found)"
+        )
 
     end_time = time.perf_counter()
     print(f"Optimization completed in {end_time - start_time:.2f} seconds")
@@ -464,6 +502,8 @@ def solve_inverse_problem_for_ukappa(
         "iterations": len(iterations),
         "objectives": objectives,
         "kappa_errors": kappa_errors,
+        "reg_values": reg_values,
+        "best_reg_value": best_reg_value,
     }
 
 
@@ -489,10 +529,10 @@ def main():
         "--num_samples", type=int, default=5, help="Number of samples to process"
     )
     parser.add_argument(
-        "--output_dir",
+        "--base_output_dir",
         type=str,
-        default="figures/ukappa_inverse",
-        help="Output directory",
+        default="results/ukappa_inverse",
+        help="Base directory for saving run outputs",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
@@ -529,6 +569,19 @@ def main():
         help="p value for Lp norm in value/gradient regularizers",
     )
 
+    parser.add_argument(
+        "--lambda_min_factor",
+        type=float,
+        default=0.1,
+        help="Initial lambda_reg as fraction of target value",
+    )
+
+    parser.add_argument(
+        "--lambda_schedule_iterations",
+        type=int,
+        default=50,
+        help="Number of iterations over which lambda increases",
+    )
     args = parser.parse_args()
 
     # Set random seed for reproducibility
@@ -536,13 +589,28 @@ def main():
     torch.manual_seed(args.seed)
     print(f"Random seed set to: {args.seed}")
 
-    # Initialize wandb
+    # Initialize wandb FIRST to get the run ID
     wandb_run = wandb.init(
         project="DIPDE",
         entity="ECE689AdvDL",
         config=vars(args),
         job_type="inverse_problem",
     )
+
+    # --- Create structured output directories ---
+    run_output_dir = os.path.join(args.base_output_dir, wandb_run.id)
+    data_dir = os.path.join(run_output_dir, "data")
+    figures_dir = os.path.join(run_output_dir, "figures")
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(figures_dir, exist_ok=True)
+    print(f"Saving results to: {run_output_dir}")
+
+    # Save configuration
+    config_path = os.path.join(run_output_dir, "config.json")
+    with open(config_path, "w") as f:
+        json.dump(vars(args), f, indent=4)
+    print(f"Saved configuration to: {config_path}")
+    # -----------------------------------------
 
     # Download ukappa dataset from wandb
     print(
@@ -599,13 +667,21 @@ def main():
 
     # Limit to number of samples requested
     num_samples = min(args.num_samples, len(ukappa_dataset))
-    indices = np.random.choice(len(ukappa_dataset), num_samples, replace=False)
+    if args.dataset_type == "test":
+        total_available = len(kappa_fields_test)
+    elif args.dataset_type == "val":
+        # Assuming val uses the same logic or adjust if needed
+        total_available = len(
+            ukappa_dataset
+        )  # Placeholder if val kappa isn't loaded separately
+    else:  # train
+        total_available = len(kappa_fields_train)
 
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    indices = np.random.choice(total_available, num_samples, replace=False)
 
-    # Track overall results
-    all_results = []
+    # Track overall results and detailed results per sample
+    all_summary_results = []
+    consolidated_npz_data = {}
 
     # Process each sample
     for i, idx in enumerate(tqdm(indices, desc="Processing samples")):
@@ -613,23 +689,28 @@ def main():
             f"\n{'=' * 80}\nProcessing sample {i + 1}/{num_samples} (index {idx})\n{'=' * 80}"
         )
 
-        # Get ukappa and corresponding true kappa
+        # Get ukappa and corresponding true kappa (adapt based on dataset type if needed)
         ukappa = ukappa_dataset[idx]
+        # Assuming test set kappa is the primary target for inversion comparison
         true_kappa = kappa_fields_test[idx]
 
-        # save figures of the true kappa and ukappa
-        true_kappa_reshaped = true_kappa.reshape(args.resolution, args.resolution)
-        ukappa_reshaped = ukappa.reshape(args.resolution + 1, args.resolution + 1)
-        plt.imsave(
-            os.path.join(args.output_dir, f"true_kappa_{idx}.png"), true_kappa_reshaped
-        )
-        plt.imsave(os.path.join(args.output_dir, f"ukappa_{idx}.png"), ukappa_reshaped)
+        # Sample-specific figure directory within the main run's figures dir
+        sample_figure_dir = os.path.join(figures_dir, f"sample_{idx}")
+        # No need to create - solve_inverse_problem_for_ukappa will handle if plot_results is True
 
-        # Sample-specific output directory
-        sample_dir = os.path.join(args.output_dir, f"sample_{idx}")
-        os.makedirs(sample_dir, exist_ok=True)
+        # --- Save initial true fields (optional, consider if needed besides wandb/plots) ---
+        # true_kappa_reshaped = true_kappa.reshape(args.resolution, args.resolution)
+        # ukappa_reshaped = ukappa.reshape(args.resolution + 1, args.resolution + 1)
+        # initial_figs_dir = os.path.join(sample_figure_dir, "initial_fields")
+        # os.makedirs(initial_figs_dir, exist_ok=True)
+        # plt.imsave(
+        #     os.path.join(initial_figs_dir, f"true_kappa_{idx}.png"), true_kappa_reshaped
+        # )
+        # plt.imsave(os.path.join(initial_figs_dir, f"ukappa_{idx}.png"), ukappa_reshaped)
+        # -----------------------------------------------------------------------------
 
         # Solve the inverse problem
+        # Pass the sample-specific figure directory
         results = solve_inverse_problem_for_ukappa(
             ukappa=ukappa,
             true_kappa=true_kappa,
@@ -642,33 +723,40 @@ def main():
             norm_max=norm_max,
             plot_results=not args.no_plot,
             max_iterations=args.max_iterations,
-            output_dir=sample_dir,
+            output_dir=sample_figure_dir,  # Use the dedicated figure dir
             idx=idx,
             regularizer_type=args.regularizer,
             p_norm=args.p_norm,
+            lambda_min_factor=args.lambda_min_factor,
+            lambda_schedule_iterations=args.lambda_schedule_iterations,
         )
 
-        # Save results
-        np.savez(
-            os.path.join(sample_dir, "results.npz"),
-            kappa_true=results["kappa_true"],
-            kappa_recovered=results["kappa_recovered"],
-            ukappa_true=results["ukappa_true"],
-            ukappa_measured=results["ukappa_measured"],
-            ukappa_recovered=results["ukappa_recovered"],
-        )
+        # Store results for the consolidated npz file
+        # Use str(idx) as key because np.savez requires string keys
+        consolidated_npz_data[str(idx)] = {
+            "kappa_true": results["kappa_true"],
+            "kappa_recovered": results["kappa_recovered"],
+            "ukappa_true": results["ukappa_true"],
+            "ukappa_measured": results["ukappa_measured"],
+            "ukappa_recovered": results["ukappa_recovered"],
+            # Add other numerical arrays if needed, e.g., objectives, errors per iteration
+            "objectives": results["objectives"],
+            "kappa_errors_iter": results["kappa_errors"],
+            "reg_values": results["reg_values"],
+        }
 
-        # Log to wandb
+        # Log individual sample metrics to wandb
         wandb.log(
             {
-                f"sample_{idx}/kappa_error": results["kappa_error"],
-                f"sample_{idx}/ukappa_error": results["ukappa_error"],
+                f"sample_{idx}/kappa_error_final": results["kappa_error"],
+                f"sample_{idx}/ukappa_error_final": results["ukappa_error"],
                 f"sample_{idx}/iterations": results["iterations"],
-            }
+            },
+            step=i,  # Log against sample processing step
         )
 
         # Store summary results
-        all_results.append(
+        all_summary_results.append(
             {
                 "index": idx,
                 "kappa_error": results["kappa_error"],
@@ -677,36 +765,59 @@ def main():
             }
         )
 
+    # --- Save consolidated numerical data ---
+    npz_path = os.path.join(data_dir, "results.npz")
+    np.savez(npz_path, **consolidated_npz_data)
+    print(f"Saved consolidated numerical results to: {npz_path}")
+    # --------------------------------------
+
     # Compute and log summary statistics
-    kappa_errors = [r["kappa_error"] for r in all_results]
-    ukappa_errors = [r["ukappa_error"] for r in all_results]
-    iterations = [r["iterations"] for r in all_results]
+    kappa_errors = [r["kappa_error"] for r in all_summary_results]
+    ukappa_errors = [r["ukappa_error"] for r in all_summary_results]
+    iterations = [r["iterations"] for r in all_summary_results]
 
     summary = {
         "mean_kappa_error": np.mean(kappa_errors),
         "std_kappa_error": np.std(kappa_errors),
+        "min_kappa_error": np.min(kappa_errors),
+        "max_kappa_error": np.max(kappa_errors),
         "mean_ukappa_error": np.mean(ukappa_errors),
         "std_ukappa_error": np.std(ukappa_errors),
+        "min_ukappa_error": np.min(ukappa_errors),
+        "max_ukappa_error": np.max(ukappa_errors),
         "mean_iterations": np.mean(iterations),
+        "std_iterations": np.std(iterations),
         "noise_level": args.noise,
         "initial_lambda_reg": args.initial_lambda_reg,
         "initial_step_size": args.initial_step_size,
-        "num_samples": num_samples,
+        "num_samples_processed": num_samples,
         "regularizer_type": args.regularizer,
         "p_norm": args.p_norm if args.regularizer in ["value", "gradient"] else None,
+        "max_iterations_allowed": args.max_iterations,
+        "lambda_min_factor": args.lambda_min_factor,
+        "lambda_schedule_iterations": args.lambda_schedule_iterations,
     }
 
     print("\nSummary Statistics:")
     for key, value in summary.items():
-        print(f"{key}: {value}")
+        # Format floats nicely for printing
+        if isinstance(value, float):
+            print(f"{key}: {value:.4f}")
+        else:
+            print(f"{key}: {value}")
 
+    # Log summary to wandb (as final summary)
     wandb.log(summary)
 
     # Save summary to file
-    with open(os.path.join(args.output_dir, "summary.txt"), "w") as f:
-        f.write("Summary Statistics:\n")
+    summary_path = os.path.join(run_output_dir, "summary.txt")
+    with open(summary_path, "w") as f:
+        f.write("Run Configuration:\n")
+        json.dump(vars(args), f, indent=4)
+        f.write("\n\nSummary Statistics:\n")
         for key, value in summary.items():
             f.write(f"{key}: {value}\n")
+    print(f"Saved summary statistics to: {summary_path}")
 
     print(f"\nInverse problem solution completed for {num_samples} samples.")
     wandb.finish()
