@@ -207,7 +207,7 @@ def solve_inverse_problem_for_ukappa(
     options = {
         "maxiter": 3,
         "disp": True,
-        "return_all": True,
+        # "return_all": True,
         "c1": 0.001,
         "c2": 0.9,
     }
