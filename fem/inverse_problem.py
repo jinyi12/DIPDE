@@ -352,7 +352,7 @@ def test_gradient_1():
     kappa = 1 + 100 * y_vals
     fem_problem.set_parameters(f=f, u_d=u_d)
     u_true = fem_problem.forward(kappa)
-    fem_problem.mesh.plot(u_true)
+    # fem_problem.mesh.plot(u_true)
     uhat = u_true + 0.1 * np.random.randn(u_true.size)
     uhat[fem_problem.dirichlet_nodes] = u_d[fem_problem.dirichlet_nodes]
     kappa_noise = np.random.randn(kappa.size)
@@ -363,17 +363,44 @@ def test_gradient_1():
     epsilon_list = np.array([1, 0.1, 0.01, 0.001, 0.0001, 0.00001])
     dJ, errors = verify_gradient(fem_problem, kappa, uhat, epsilon_list)
 
-    plt.figure()
-    plt.plot(epsilon_list, errors)
-    plt.xlabel(r"$\epsilon$")
-    plt.ylabel(r"E")
-    plt.xscale("log")
-    plt.yscale("log")
-    plt.tight_layout()
-    plt.xlim([epsilon_list[-1], epsilon_list[0]])
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(6, 3))
+
+    im = ax1.tricontourf(
+        fem_problem.mesh.coordinates[0, :],
+        fem_problem.mesh.coordinates[1, :],
+        u_true,
+        20,
+        cmap="viridis",
+    )
+    # plt.colorbar(im, ax=ax1)
+    
+    # Overlay mesh
+    # for e in range(fem_problem.mesh.num_elements):
+    #     nodes = fem_problem.mesh.connectivity[:, e]
+    #     # Close the loop
+    #     nodes = np.append(nodes, nodes[0])
+    #     ax1.plot(
+    #         fem_problem.mesh.coordinates[0, nodes], fem_problem.mesh.coordinates[1, nodes], "k-", lw=0.5
+    #     )
+
+    ax1.set_xlabel("x")
+    ax1.set_ylabel("y")
+    ax1.set_xlim([0,1])
+    ax1.set_ylim([0,1])
+    ax1.set_xticks([])
+    ax1.set_yticks([])
+    # ax1.axis("equal")
+    
+    ax2.plot(epsilon_list, errors)
+    ax2.set_xlabel(r"$\epsilon$")
+    ax2.set_ylabel(r"$L^2$ difference")
+    ax2.set_xscale("log")
+    ax2.set_yscale("log")
+    ax2.set_xlim([epsilon_list[-1], epsilon_list[0]])
+    
+    fig.tight_layout()
     plt.show()
-
-
+    
 # Test gradient with zero forcing and nonzero BCs
 def test_gradient_2():
     import matplotlib.pyplot as plt
@@ -571,6 +598,6 @@ def example_inverse_problem():
 
 if __name__ == "__main__":
     np.random.seed(43)
-    # test_gradient_1()
+    test_gradient_1()
     # test_gradient_2()
-    example_inverse_problem()
+    # example_inverse_problem()
