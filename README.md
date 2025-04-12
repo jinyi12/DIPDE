@@ -138,20 +138,6 @@ python -m src.ukappa_inverse_problem \
     --p_norm 2                       # p-norm value (for value/gradient regularizers)
 ```
 
-## Key Parameters
-
-The main script `src/ukappa_inverse_problem.py` accepts the following important parameters:
-
-- `--noise`: Noise level to add to the measurements
-- `--num_samples`: Number of samples to process
-- `--max_iterations`: Maximum number of optimization iterations
-- `--initial_step_size`: Initial step size for optimization
-- `--initial_lambda_reg`: Initial regularization strength
-- `--regularizer`: Type of regularizer (denoiser, tv, value, gradient)
-- `--p_norm`: p-norm value for value or gradient regularizers
-- `--lambda_min_factor`: Minimum lambda as fraction of initial value
-- `--lambda_schedule_iterations`: Iterations over which lambda decreases
-
 ## Example Results
 
 The solver generates visualizations of:
@@ -161,6 +147,44 @@ The solver generates visualizations of:
 
 Results are saved in the `figures/` and `results/` directories.
 
+### Output Files
+
+- **`figures/`**: Contains plots generated during the optimization process for each sample, such as:
+    - `kappa_comparison.png`: Compares true, initial, and recovered kappa fields.
+    - `solution_comparison.png`: Compares true, measured, and recovered solution fields.
+    - `convergence.png`: Shows the convergence of the objective function and kappa error over iterations.
+- **`results/<run_id>/data/results.npz`**: A NumPy archive file containing detailed numerical results for each processed sample. The data is stored in a dictionary-like structure where keys are the string representation of the sample index (e.g., '42'). Each sample index key maps to another dictionary containing:
+    - `kappa_true`: The ground truth conductivity field (flattened).
+    - `kappa_recovered`: The recovered conductivity field (flattened).
+    - `ukappa_true`: The ground truth solution field (flattened).
+    - `ukappa_measured`: The noisy measurement field used for inversion (flattened).
+    - `ukappa_recovered`: The solution field computed using the recovered kappa (flattened).
+    - `objectives`: A list of objective function values at each inner optimization iteration.
+    - `kappa_errors_iter`: A list of relative L2 errors in kappa at each inner optimization iteration.
+    - `reg_values`: A list of regularization term values at each outer iteration.
+- **`results/<run_id>/summary.txt`**: A text file containing the run configuration and summary statistics (mean, std, min, max) for kappa and ukappa errors across all processed samples.
+- **`results/<run_id>/config.json`**: A JSON file saving the configuration arguments used for the run.
+
+## Key Parameters
+
+The main script `src/ukappa_inverse_problem.py` accepts the following important parameters:
+
+- `--noise`: Noise level to add to the measurements (fraction of signal L2 norm).
+- `--resolution`: Mesh resolution (e.g., 64 for a 64x64 grid).
+- `--num_samples`: Number of samples from the dataset to process.
+- `--max_iterations`: Maximum number of outer optimization iterations.
+- `--initial_step_size`: Initial step size for the alternating minimization optimization.
+- `--initial_lambda_reg`: Initial regularization strength (lambda).
+- `--lambda_min_factor`: The final regularization strength lambda will decay to, as a fraction of the initial value.
+- `--lambda_schedule_iterations`: Number of iterations over which lambda decreases linearly from the initial value to the minimum value.
+- `--regularizer`: Type of regularizer (`denoiser`, `tv`, `value`, `gradient`).
+- `--p_norm`: The p-value for the Lp norm when using `value` or `gradient` regularizers (default: 2).
+- `--epsilon`: Smoothing parameter for the Total Variation (TV) regularizer (default: 1e-6).
+- `--denoiser_path`: Path to the pre-trained denoiser model file (required if `regularizer` is `denoiser`).
+- `--base_output_dir`: Base directory where run-specific output folders (named by wandb run ID) will be created.
+- `--seed`: Random seed for reproducibility.
+- `--dataset_type`: Which dataset split to use (`train`, `val`, `test`).
+- `--no_plot`: Flag to disable generating and saving plots.
 
 ## License
 
