@@ -74,6 +74,7 @@ def solve_inverse_problem_for_ukappa(
     idx=0,
     regularizer_type="denoiser",
     p_norm=2,
+    epsilon=1e-6,
     lambda_min_factor=0.1,  # Start lambda_reg at this fraction of initial_lambda_reg
     lambda_schedule_iterations=50,  # Iterations over which lambda increases
 ):
@@ -163,7 +164,7 @@ def solve_inverse_problem_for_ukappa(
         dx = fem_problem.dx
         dy = fem_problem.dy
         regularizer = TotalVariationRegularizer(
-            lambda_reg=initial_lambda_reg, dx=dx, dy=dy
+            lambda_reg=initial_lambda_reg, dx=dx, dy=dy, epsilon=epsilon
         )
         print(f"Using total variation regularization with λ={initial_lambda_reg}")
     else:
@@ -582,6 +583,12 @@ def main():
         default=50,
         help="Number of iterations over which lambda increases",
     )
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        default=1e-6,
+        help="Smoothing parameter for TV regularizer",
+    )
     args = parser.parse_args()
 
     # Set random seed for reproducibility
@@ -729,6 +736,7 @@ def main():
             p_norm=args.p_norm,
             lambda_min_factor=args.lambda_min_factor,
             lambda_schedule_iterations=args.lambda_schedule_iterations,
+            epsilon=args.epsilon,
         )
 
         # Store results for the consolidated npz file
