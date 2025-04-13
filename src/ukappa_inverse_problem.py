@@ -289,10 +289,10 @@ def solve_inverse_problem_for_ukappa(
     conv_tol = 1e-5
 
     # Additional convergence criteria parameters
-    obj_conv_tol = 1e-4   # Tolerance for relative change in objective function
-    grad_norm_tol = 1e-4  # Tolerance for gradient norm
-    reg_conv_tol = 1e-4   # Tolerance for relative change in regularization value
-    window_size = 10       # Window size for moving average calculations
+    obj_conv_tol = 5e-4   # Tolerance for relative change in objective function
+    grad_norm_tol = 5e-4  # Tolerance for gradient norm
+    reg_conv_tol = 5e-4   # Tolerance for relative change in regularization value
+    window_size = 20       # Window size for moving average calculations
     
     # Tracking variables for convergence criteria
     prev_objective = float('inf')
@@ -432,7 +432,6 @@ def solve_inverse_problem_for_ukappa(
                     f"true_kappa_{idx}": wandb.Image(true_kappa_fig),
                     f"ukappa_{idx}": wandb.Image(ukappa_fig),
                 },
-                step=k
             )
 
             # Close the figures to avoid memory leaks
@@ -545,23 +544,37 @@ def solve_inverse_problem_for_ukappa(
         # Plot solutions
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
-        # Original (clean) solution
-        title = "True Solution"
-        im1 = fem_problem.mesh.plot(ukappa, title=title)
-        axes[0].set_title(title)
-        fig.colorbar(im1, ax=axes[0])
+        # Get node coordinates
+        x_nodes = fem_problem.mesh.coordinates[0, :]
+        y_nodes = fem_problem.mesh.coordinates[1, :]
 
-        # Noisy measurements
-        title = f"Measurements (Noise: {noise_level:.2%})"
-        im2 = fem_problem.mesh.plot(u_meas, title=title)
-        axes[1].set_title(title)
-        fig.colorbar(im2, ax=axes[1])
+        # Data to plot and titles
+        solutions = [ukappa, u_meas, u_recovered]
+        titles = [
+            "True Solution",
+            f"Measurements (Noise: {noise_level:.2%})",
+            f"Recovered Solution (Error: {u_error_rel:.2%})"
+        ]
+        
+        # Determine common color limits for solutions
+        all_solution_data = np.concatenate(solutions)
+        vmin = np.min(all_solution_data)
+        vmax = np.max(all_solution_data)
 
-        # Recovered solution
-        title = f"Recovered Solution (Error: {u_error_rel:.2%})"
-        im3 = fem_problem.mesh.plot(u_recovered, title=title)
-        axes[2].set_title(title)
-        fig.colorbar(im3, ax=axes[2])
+        for i, (sol, title) in enumerate(zip(solutions, titles)):
+            # Use tricontourf for plotting solution on nodes - similar to mesh.plot()
+            im = axes[i].tricontourf(
+                x_nodes, 
+                y_nodes, 
+                sol, 
+                levels=20, 
+                cmap="viridis", 
+                vmin=vmin, 
+                vmax=vmax
+            )
+            axes[i].set_title(title)
+            fig.colorbar(im, ax=axes[i])
+            axes[i].set_aspect('equal')
 
         for ax in axes:
             ax.set_xlabel("x")

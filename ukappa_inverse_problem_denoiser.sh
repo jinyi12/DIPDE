@@ -3,7 +3,7 @@ python -m src.ukappa_inverse_problem \
 --num_samples 100 \
 --max_iterations 1000 \
 --initial_step_size 10000 \
---initial_lambda_reg 0.000005 \
+--initial_lambda_reg 0.000008 \
 --lambda_min_factor 1 \
 --lambda_schedule_iterations 100 \
 --regularizer denoiser \
