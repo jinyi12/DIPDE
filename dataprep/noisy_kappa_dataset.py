@@ -64,6 +64,10 @@ class NoisyKappaFieldDataset(Dataset):
         self.reshape_size = reshape_size
         self.device = device
         self.transforms = transforms
+        self.norm_min = None
+        self.norm_max = None
+        self.mean = None
+        self.std = None
 
         if seed is not None:
             np.random.seed(seed)
@@ -113,7 +117,7 @@ class NoisyKappaFieldDataset(Dataset):
                 self.logger.info(f"Reshaped flattened samples to {kappa_fields.shape}")
 
             # Convert to torch tensor
-            self.clean_fields = torch.tensor(
+            self.clean_fields_original = torch.tensor(
                 kappa_fields, dtype=torch.float32, device=self.device
             )  # shape (n_samples, nx, ny)
 
@@ -125,15 +129,19 @@ class NoisyKappaFieldDataset(Dataset):
 
             # resize if reshape_size is provided
             if self.reshape_size is not None:
-                self.clean_fields = TF.resize(
-                    self.clean_fields,
+                self.clean_fields_original = TF.resize(
+                    self.clean_fields_original,
                     self.reshape_size,
                     interpolation=TF.InterpolationMode.BILINEAR,
                 )
 
             # normalize globally to [0, 1]
-            self.clean_fields = (self.clean_fields - self.clean_fields.min()) / (
-                self.clean_fields.max() - self.clean_fields.min()
+            self.norm_min = self.clean_fields_original.min().item()
+            self.norm_max = self.clean_fields_original.max().item()
+            self.mean = self.clean_fields_original.mean().item()
+            self.std = self.clean_fields_original.std().item()
+            self.clean_fields = (self.clean_fields_original - self.norm_min) / (
+                self.norm_max - self.norm_min
             )
 
             # compute signal power across the spatial dimensions (nx, ny)
@@ -141,7 +149,11 @@ class NoisyKappaFieldDataset(Dataset):
 
             self.logger.info(
                 f"Preprocessed data shape: {self.clean_fields.shape}, "
-                f"Signal powers shape: {self.signal_powers.shape}"
+                f"Signal powers shape: {self.signal_powers.shape}, "
+                f"Mean: {self.mean}, "
+                f"Std: {self.std}, "
+                f"Norm min: {self.norm_min}, "
+                f"Norm max: {self.norm_max}"
             )
 
         except Exception as e:

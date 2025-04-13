@@ -3,6 +3,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 import torch.nn as nn
+from typing import List, Optional
 
 
 class Regularizer(ABC):
@@ -10,7 +11,7 @@ class Regularizer(ABC):
 
     @abstractmethod
     def __call__(
-        self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
+        self, kappa: npt.NDArray[np.float64], lambda_reg: Optional[float] = None
     ) -> float:
         """Calculate regularization value.
 
@@ -25,7 +26,7 @@ class Regularizer(ABC):
 
     @abstractmethod
     def gradient(
-        self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
+        self, kappa: npt.NDArray[np.float64], lambda_reg: Optional[float] = None
     ) -> npt.NDArray[np.float64]:
         """Calculate gradient of regularization term.
 
@@ -44,7 +45,10 @@ class Regularizer(ABC):
         Args:
             lambda_reg: New regularization strength
         """
-        self.lambda_reg = lambda_reg
+        # Base implementation might not do anything if lambda is handled differently
+        # or within __call__/gradient, but subclasses can override.
+        # Specific regularizers like ValueRegularizer already store lambda_reg.
+        pass
 
 
 class ValueRegularizer(Regularizer):
@@ -86,11 +90,15 @@ class ValueRegularizer(Regularizer):
             self.lambda_reg * np.sign(kappa) * np.abs(kappa) ** (self.p - 1) * cell_area
         )
 
+    def update_lambda(self, lambda_reg: float) -> None:
+        """Update the regularization strength."""
+        self.lambda_reg = lambda_reg
+
 
 class GradientRegularizer(Regularizer):
     """Regularizer that penalizes the Lp norm of the parameter gradients.
 
-    The functional is defined as: R(κ) = (λ/p) ∫|∇κ|ᵖ dx
+    The functional is defined as R(κ) = (λ/p) ∫|∇κ|ᵖ dx
 
     This enforces smoothness in the parameter κ.
 
@@ -170,6 +178,10 @@ class GradientRegularizer(Regularizer):
 
         return (-self.lambda_reg * div_weighted_grad).flatten()
 
+    def update_lambda(self, lambda_reg: float) -> None:
+        """Update the regularization strength."""
+        self.lambda_reg = lambda_reg
+
 
 class TotalVariationRegularizer(Regularizer):
     """Total Variation regularizer.
@@ -191,23 +203,28 @@ class TotalVariationRegularizer(Regularizer):
         self.epsilon = epsilon  # Smoothing parameter
 
     def __call__(
-        self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
+        self, kappa: npt.NDArray[np.float64], lambda_reg: Optional[float] = None
     ) -> float:
         """Calculate the Total Variation regularization value."""
-        if lambda_reg is not None:
-            self.lambda_reg = lambda_reg
+        current_lambda = lambda_reg if lambda_reg is not None else self.lambda_reg
         kappa_2d = kappa.reshape((int(np.sqrt(len(kappa))), -1))
-        dx = np.gradient(kappa_2d, axis=0) / self.dx
-        dy = np.gradient(kappa_2d, axis=1) / self.dy
+        # Use finite differences for gradient approximation
+        # Ensure we handle boundary conditions appropriately if needed,
+        # np.gradient uses central differences in the interior and first differences at boundaries
+        grad_x = np.gradient(kappa_2d, axis=0) / self.dx
+        grad_y = np.gradient(kappa_2d, axis=1) / self.dy
 
-        # Smoothed TV: ∫√(|∇κ|² + ε) dx
-        return self.lambda_reg * np.sum(np.sqrt(dx**2 + dy**2 + self.epsilon))
+        # Smoothed TV: ∫√(|∇κ|² + ε) dx dy
+        # Integrate over the area by multiplying by cell area dx * dy
+        cell_area = self.dx * self.dy
+        return current_lambda * np.sum(
+            np.sqrt(grad_x**2 + grad_y**2 + self.epsilon) * cell_area
+        )
 
     def gradient(
-        self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
+        self, kappa: npt.NDArray[np.float64], lambda_reg: Optional[float] = None
     ) -> npt.NDArray[np.float64]:
-        if lambda_reg is not None:
-            self.lambda_reg = lambda_reg
+        current_lambda = lambda_reg if lambda_reg is not None else self.lambda_reg
         # Convert numpy array to torch tensor and enable gradient tracking.
         kappa_tensor = torch.tensor(
             kappa.reshape((int(np.sqrt(len(kappa))), -1)),
@@ -221,7 +238,7 @@ class TotalVariationRegularizer(Regularizer):
         grad_x = torch.gradient(kappa_tensor, spacing=self.dx)[0] / self.dx
         grad_y = torch.gradient(kappa_tensor, spacing=self.dy)[1] / self.dy
         tv = torch.sum(torch.sqrt(grad_x**2 + grad_y**2 + self.epsilon))
-        tv = self.lambda_reg * tv * self.dx * self.dy
+        tv = current_lambda * tv * self.dx * self.dy
 
         # Trigger the backward pass:
         tv.backward()
@@ -239,8 +256,8 @@ class DenoiserRegularizer(Regularizer):
         denoiser: nn.Module,
         lambda_reg: float,
         device: str = "cpu",
-        norm_min: float = None,
-        norm_max: float = None,
+        norm_min: Optional[float] = None,
+        norm_max: Optional[float] = None,
     ):
         self.denoiser = denoiser
         self.lambda_reg = lambda_reg
@@ -249,72 +266,123 @@ class DenoiserRegularizer(Regularizer):
         self.norm_min = norm_min
         self.norm_max = norm_max
 
-    def __call__(
-        self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
-    ) -> float:
-        with torch.no_grad():
-            if lambda_reg is not None:
-                self.lambda_reg = lambda_reg
-            kappa_torch = torch.from_numpy(kappa).float().to(self.device)
-            # normalize kappa to [0, 1]
+    def _preprocess(self, kappa: npt.NDArray[np.float64]) -> torch.Tensor:
+        """Convert numpy array to torch tensor, normalize, and set requires_grad."""
+        kappa_torch = torch.from_numpy(kappa).float().to(self.device)
+        if self.norm_min is not None and self.norm_max is not None:
             kappa_torch = (kappa_torch - self.norm_min) / (
                 self.norm_max - self.norm_min
             )
-            # require gradient for denoiser
-            kappa_torch.requires_grad_(True)
-            if kappa_torch.ndim == 1:
-                side = int(np.sqrt(len(kappa)))
-                kappa_2d = kappa_torch.reshape(1, 1, side, side)
-            elif kappa_torch.ndim == 2:
-                # add batch and channel dimensions
-                kappa_2d = kappa_torch.unsqueeze(0).unsqueeze(0)
-
-            # could have channel dimension, but missing batch dimension
-            elif kappa_torch.ndim == 3:
-                kappa_2d = kappa_torch.unsqueeze(0)
-            else:
-                kappa_2d = kappa_torch
-
-            denoised = (
-                self.denoiser(kappa_2d).squeeze(0).squeeze(0).cpu().numpy()
-            )  # shape (H, W)
-
-            # denormalize denoised
-            denoised = denoised * (self.norm_max - self.norm_min) + self.norm_min
-
-            denoised = denoised.reshape(-1)
-            # Energy: λ/2 x^T (x - f(x))
-            energy = 0.5 * self.lambda_reg * (kappa @ (kappa - denoised))
-        return energy
-
-    def gradient(
-        self, kappa: npt.NDArray[np.float64], lambda_reg: float = None
-    ) -> npt.NDArray[np.float64]:
-        # Revised gradient computation using autograd to correctly differentiate the energy
-        if lambda_reg is not None:
-            self.lambda_reg = lambda_reg
-        kappa_torch = torch.from_numpy(kappa).float().to(self.device)
-        kappa_torch.requires_grad_(True)
-
-        # normalize kappa to [0, 1]
-        kappa_torch = (kappa_torch - self.norm_min) / (self.norm_max - self.norm_min)
 
         if kappa_torch.ndim == 1:
             side = int(np.sqrt(len(kappa)))
             kappa_2d = kappa_torch.reshape(1, 1, side, side)
         elif kappa_torch.ndim == 2:
-            kappa_2d = kappa_torch.unsqueeze(0).unsqueeze(0)
-        elif kappa_torch.ndim == 3:
-            kappa_2d = kappa_torch.unsqueeze(0)
-        else:
+            kappa_2d = kappa_torch.unsqueeze(0).unsqueeze(0) # Add batch and channel
+        elif kappa_torch.ndim == 3: # Assume (C, H, W)
+            kappa_2d = kappa_torch.unsqueeze(0) # Add batch
+        else: # Assume (B, C, H, W)
             kappa_2d = kappa_torch
-        # Compute denoiser output with gradient tracking
-        denoised = self.denoiser(kappa_2d).squeeze(0).squeeze(0)  # shape (H, W)
-        denoised = denoised.reshape(-1)
 
-        # denormalize denoised
-        denoised = denoised * (self.norm_max - self.norm_min) + self.norm_min
+        kappa_2d.requires_grad_(True)
+        return kappa_2d
 
-        # analytical RED gradient (x - f(x))
-        grad = kappa_torch - denoised
-        return self.lambda_reg * grad.detach().cpu().numpy()
+    def _postprocess(self, denoised_norm: torch.Tensor) -> npt.NDArray[np.float64]:
+        """Denormalize and convert back to numpy."""
+        denoised = denoised_norm.squeeze().detach().cpu().numpy()
+        if self.norm_min is not None and self.norm_max is not None:
+            denoised = denoised * (self.norm_max - self.norm_min) + self.norm_min
+        return denoised.flatten()
+
+
+    def __call__(
+        self, kappa: npt.NDArray[np.float64], lambda_reg: Optional[float] = None
+    ) -> float:
+        """Calculate the RED regularization value: λ/2 ||κ - f(κ)||_2^2"""
+        current_lambda = lambda_reg if lambda_reg is not None else self.lambda_reg
+        with torch.no_grad():
+            kappa_2d_norm = self._preprocess(kappa)
+            # Detach input before passing to denoiser if not computing gradient via autograd
+            denoised_norm = self.denoiser(kappa_2d_norm.detach())
+            denoised = self._postprocess(denoised_norm)
+
+            # R(x) = λ/2 ||x - f(x)||^2
+            diff = kappa - denoised
+            energy = 0.5 * current_lambda * np.dot(diff, diff)
+            # Note: Removed the original x^T(x-f(x)) formulation as ||x-f(x)||^2 is more common for RED.
+            # If the original formulation is intended, this needs adjustment.
+        return energy
+
+    def gradient(
+        self, kappa: npt.NDArray[np.float64], lambda_reg: Optional[float] = None
+    ) -> npt.NDArray[np.float64]:
+        """Calculate the RED gradient: λ * (κ - f(κ)) with respect to the physical kappa"""
+        # This uses the common approximation grad(R(x)) ≈ λ * (x - f(x))
+        # A more exact gradient requires differentiating through the denoiser.
+        current_lambda = lambda_reg if lambda_reg is not None else self.lambda_reg
+        with torch.no_grad():
+            kappa_2d_norm = self._preprocess(kappa)
+            # Detach input before passing to denoiser
+            denoised_norm = self.denoiser(kappa_2d_norm.detach())
+            
+            #! \nabla_{\kappa} f(\hat{\kappa}) = \frac{\partial f(\hat{\kappa})}{\partial \hat{\kappa}} \frac{\partial \hat{\kappa}}{\partial \kappa}
+            
+            #! \nabla_{\hat{\kappa}} f(\hat{\kappa}) \approx \hat{\kappa} - f(\hat{\kappa})
+            #! Chain rule: \frac{\partial \kappa}{\partial \hat{\kappa}} = \frac{1}{\text{norm\_max} - \text{norm\_min}}
+            #! therefore \nabla_{\kappa} f(\kappa) = \frac{1}{\text{norm\_max} - \text{norm\_min}} (\hat{\kappa} - f(\hat{\kappa}))
+            grad = (kappa_2d_norm - denoised_norm) / (self.norm_max - self.norm_min)
+            grad = grad.flatten().cpu().detach().numpy()
+            
+        return current_lambda * grad
+
+    def update_lambda(self, lambda_reg: float) -> None:
+        """Update the regularization strength."""
+        self.lambda_reg = lambda_reg
+
+
+class CompositeRegularizer(Regularizer):
+    """Combines multiple regularizers with individual weights."""
+
+    def __init__(
+        self,
+        regularizers: List[Regularizer],
+        weights: Optional[List[float]] = None,
+        global_lambda_reg: float = 1.0, # A global scaling factor
+    ):
+        self.regularizers = regularizers
+        if weights is None:
+            self.weights = [1.0] * len(regularizers)
+        else:
+            if len(weights) != len(regularizers):
+                raise ValueError("Number of weights must match number of regularizers")
+            self.weights = weights
+        self.global_lambda_reg = global_lambda_reg # Store the global lambda
+
+    def __call__(
+        self, kappa: npt.NDArray[np.float64], lambda_reg: Optional[float] = None
+    ) -> float:
+        """Calculate the weighted sum of regularization values."""
+        current_global_lambda = lambda_reg if lambda_reg is not None else self.global_lambda_reg
+        total_value = 0.0
+        for reg, weight in zip(self.regularizers, self.weights):
+            # Pass the global lambda scaled by the weight to individual regularizers
+            # Assumes individual regularizers use the passed lambda_reg override
+            total_value += reg(kappa, lambda_reg=current_global_lambda * weight)
+        return total_value
+
+    def gradient(
+        self, kappa: npt.NDArray[np.float64], lambda_reg: Optional[float] = None
+    ) -> npt.NDArray[np.float64]:
+        """Calculate the weighted sum of regularization gradients."""
+        current_global_lambda = lambda_reg if lambda_reg is not None else self.global_lambda_reg
+        total_gradient = np.zeros_like(kappa)
+        for reg, weight in zip(self.regularizers, self.weights):
+            # Pass the global lambda scaled by the weight
+            total_gradient += reg.gradient(kappa, lambda_reg=current_global_lambda * weight)
+        return total_gradient
+
+    def update_lambda(self, lambda_reg: float) -> None:
+        """Update the global regularization strength."""
+        # This updates the global lambda. Individual regularizers will use this
+        # scaled by their weight when __call__ or gradient is invoked.
+        self.global_lambda_reg = lambda_reg

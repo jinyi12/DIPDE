@@ -156,8 +156,9 @@ def generate_ukappa_dataset(
         reshape_size=(resolution, resolution),
     )
 
-    # Get the clean kappa fields (without noise),
-    kappa_fields = dataset.clean_fields.numpy()  # We don't want noise for this dataset
+    # Get the clean kappa fields (without noise) and without normalization,
+    kappa_fields = dataset.clean_fields_original.numpy()  # We don't want noise for this dataset
+    kappa_fields_normalized = dataset.clean_fields.numpy()
 
     # Limit number of samples if specified
     if num_samples is not None and num_samples < len(kappa_fields):
@@ -167,10 +168,11 @@ def generate_ukappa_dataset(
 
     # Prepare array to store u_kappa solutions
     u_kappa_dataset = []
+    u_kappa_dataset_normalized = []
 
     # Process each kappa field
     start_time = time.time()
-    for i, kappa in enumerate(tqdm(kappa_fields)):
+    for i, (kappa, kappa_normalized) in enumerate(zip(kappa_fields, kappa_fields_normalized)):
         # Check if we should plot this example
         plot_this_example = i < plot_examples
 
@@ -178,48 +180,66 @@ def generate_ukappa_dataset(
         u_kappa = solve_forward_problem(
             kappa, resolution=resolution, plot_example=plot_this_example, example_idx=i
         )
+        u_kappa_normalized = solve_forward_problem(
+            kappa_normalized, resolution=resolution, plot_example=plot_this_example, example_idx=i
+        )
 
         # Store the solution
         u_kappa_dataset.append(u_kappa)
-
+        u_kappa_dataset_normalized.append(u_kappa_normalized)
     # Convert to numpy array
     u_kappa_dataset = np.array(u_kappa_dataset)
-
-    # Save the dataset
-    print(f"Saving dataset to {output_path}")
+    u_kappa_dataset_normalized = np.array(u_kappa_dataset_normalized)
+    
+    # Save the datasets
+    print(f"Saving datasets to {output_path} and {output_path.replace('.npy', '_normalized.npy')}")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     np.save(output_path, u_kappa_dataset)
+    np.save(output_path.replace('.npy', '_normalized.npy'), u_kappa_dataset_normalized)
+    
 
     # Report statistics
     end_time = time.time()
     print(f"Generated {len(u_kappa_dataset)} u_kappa solutions")
     print(f"Time taken: {end_time - start_time:.2f} seconds")
     print(f"Dataset shape: {u_kappa_dataset.shape}")
-    print(f"Min value: {u_kappa_dataset.min()}")
-    print(f"Max value: {u_kappa_dataset.max()}")
-    print(f"Mean value: {u_kappa_dataset.mean()}")
-    print(f"Std value: {u_kappa_dataset.std()}")
+    print(f"Unnormalized dataset - Min: {u_kappa_dataset.min()}, Max: {u_kappa_dataset.max()}, Mean: {u_kappa_dataset.mean()}, Std: {u_kappa_dataset.std()}")
+    print(f"Normalized dataset - Min: {u_kappa_dataset_normalized.min()}, Max: {u_kappa_dataset_normalized.max()}, Mean: {u_kappa_dataset_normalized.mean()}, Std: {u_kappa_dataset_normalized.std()}")
 
     # Optionally log to wandb
     if use_wandb:
         wandb.log(
             {
                 "dataset_size": len(u_kappa_dataset),
-                "min_value": u_kappa_dataset.min(),
-                "max_value": u_kappa_dataset.max(),
-                "mean_value": u_kappa_dataset.mean(),
-                "std_value": u_kappa_dataset.std(),
+                "unnormalized_min": u_kappa_dataset.min(),
+                "unnormalized_max": u_kappa_dataset.max(),
+                "unnormalized_mean": u_kappa_dataset.mean(),
+                "unnormalized_std": u_kappa_dataset.std(),
+                "normalized_min": u_kappa_dataset_normalized.min(),
+                "normalized_max": u_kappa_dataset_normalized.max(),
+                "normalized_mean": u_kappa_dataset_normalized.mean(),
+                "normalized_std": u_kappa_dataset_normalized.std(),
             }
         )
 
-        # Create an artifact
-        artifact = wandb.Artifact(
+        # Create and log artifact for unnormalized solutions
+        unnorm_artifact = wandb.Artifact(
             name=f"ukappa_dataset_{resolution}x{resolution}-{dataset_type}",
             type="dataset",
-            description=f"Dataset of u_kappa solutions from {resolution}x{resolution} kappa fields",
+            description=f"Dataset of u_kappa solutions from {resolution}x{resolution} unnormalized kappa fields",
         )
-        artifact.add_file(output_path)
-        wandb_run.log_artifact(artifact)
+        unnorm_artifact.add_file(output_path)
+        wandb_run.log_artifact(unnorm_artifact)
+        
+        # Create and log artifact for normalized solutions
+        norm_artifact = wandb.Artifact(
+            name=f"ukappa_dataset_normalized_{resolution}x{resolution}-{dataset_type}",
+            type="dataset",
+            description=f"Dataset of u_kappa solutions from {resolution}x{resolution} normalized kappa fields",
+        )
+        norm_artifact.add_file(output_path.replace('.npy', '_normalized.npy'))
+        wandb_run.log_artifact(norm_artifact)
+        
         wandb.finish()
 
 
