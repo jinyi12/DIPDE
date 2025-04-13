@@ -10,6 +10,7 @@ echo "Starting background processes..." > $PID_LOG # Overwrite or create the PID
 # --- Run L2 script ---
 LOG_L2="log_L2.out"
 echo "Starting ukappa_inverse_problem_L2.sh..."
+# unset WANDB_RUN_ID
 # Execute in a subshell to set OMP_NUM_THREADS, redirect output, run in background
 nohup bash -c 'export OMP_NUM_THREADS=$0; bash ukappa_inverse_problem_L2.sh' "$N_THREADS" > "$LOG_L2" 2>&1 &
 pid_L2=$!
@@ -19,6 +20,7 @@ echo "PID_L2: $pid_L2, Log: $LOG_L2" >> $PID_LOG
 # --- Run TV script ---
 LOG_TV="log_TV.out"
 echo "Starting ukappa_inverse_problem_TV.sh..."
+# unset WANDB_RUN_ID
 # Execute in a subshell to set OMP_NUM_THREADS, redirect output, run in background
 nohup bash -c 'export OMP_NUM_THREADS=$0; bash ukappa_inverse_problem_TV.sh' "$N_THREADS" > "$LOG_TV" 2>&1 &
 pid_TV=$!
@@ -28,6 +30,7 @@ echo "PID_TV: $pid_TV, Log: $LOG_TV" >> $PID_LOG
 # --- Run denoiser script ---
 LOG_DENOISER="log_denoiser.out"
 echo "Starting ukappa_inverse_problem_denoiser.sh..."
+# unset WANDB_RUN_ID
 # Execute in a subshell to set OMP_NUM_THREADS, redirect output, run in background
 nohup bash -c 'export OMP_NUM_THREADS=$0; bash ukappa_inverse_problem_denoiser.sh' "$N_THREADS" > "$LOG_DENOISER" 2>&1 &
 pid_DENOISER=$!

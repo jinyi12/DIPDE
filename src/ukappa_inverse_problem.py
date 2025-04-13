@@ -431,7 +431,8 @@ def solve_inverse_problem_for_ukappa(
                     f"u_recovered_{idx}": wandb.Image(u_recovered_fig),
                     f"true_kappa_{idx}": wandb.Image(true_kappa_fig),
                     f"ukappa_{idx}": wandb.Image(ukappa_fig),
-                }
+                },
+                step=k
             )
 
             # Close the figures to avoid memory leaks
@@ -952,8 +953,7 @@ def main():
                 f"sample_{idx}/kappa_error_final": results["kappa_error"],
                 f"sample_{idx}/ukappa_error_final": results["ukappa_error"],
                 f"sample_{idx}/iterations": results["iterations"],
-            },
-            step=i,  # Log against sample processing step
+            }
         )
 
         # Store summary results
@@ -970,6 +970,15 @@ def main():
     npz_path = os.path.join(data_dir, "results.npz")
     np.savez(npz_path, **consolidated_npz_data)
     print(f"Saved consolidated numerical results to: {npz_path}")
+    
+    # also add the npz file to wandb
+    consolidated_results_artifact = wandb.Artifact(
+        "consolidated_results",
+        type="dataset",
+        description="Consolidated results from inverse problem",
+    )
+    consolidated_results_artifact.add_file(npz_path)
+    wandb.log_artifact(consolidated_results_artifact)
     # --------------------------------------
 
     # Compute and log summary statistics
