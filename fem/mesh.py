@@ -231,4 +231,4 @@ class Mesh:
             plt.legend()
         plt.axis("equal")
         plt.savefig(f"figures/{title}.png")
-        plt.show()
+        plt.close()
