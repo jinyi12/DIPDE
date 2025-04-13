@@ -12,6 +12,13 @@ from dataprep.noisy_kappa_dataset import create_noisy_kappa_dataloader
 
 
 # -----------------------------------------------------------------------------
+# set seed for reproducibility 
+# -----------------------------------------------------------------------------
+torch.manual_seed(42)
+np.random.seed(42)
+
+
+# -----------------------------------------------------------------------------
 # KappaDenoiser model architecture
 # -----------------------------------------------------------------------------
 from models.denoiser import KappaDenoiser
@@ -296,8 +303,19 @@ def main():
     # Log loss curve to WandB if initialized
     if wandb_run is not None:
         wandb.log({"loss_curve": wandb.Image(plt.gcf())})
+        
+    # Save the training loss history for downstream analysis.
+    loss_history_file = "models/loss_history.npy"
+    np.save(loss_history_file, losses)
+    print(f"Loss history saved to {loss_history_file}")
 
-    # Save the model.
+    # Log loss history as a WandB artifact if WandB is initialized.
+    if wandb_run is not None:
+        loss_artifact = wandb.Artifact("loss_history", type="metrics")
+        loss_artifact.add_file(loss_history_file)
+        wandb.log_artifact(loss_artifact)
+
+    # Save the model
     torch.save(model.state_dict(), args.save_path)
     print(f"Model saved to {args.save_path}")
 
