@@ -20,16 +20,21 @@ import wandb
 from tqdm import tqdm
 from scipy.optimize import minimize
 import json
+from typing import List, Dict, Union, Optional, Tuple
+from scipy import stats
 
 from fem.inverse_problem import FEMProblem
 from models.denoiser import KappaDenoiser
 from fem.regularizers import (
+    Regularizer,
     DenoiserRegularizer,
     ValueRegularizer,
     GradientRegularizer,
     TotalVariationRegularizer,
+    CompositeRegularizer,
 )
 from dataprep.noisy_kappa_dataset import NoisyKappaFieldDataset
+from dataprep.genrf_vertices_coarse import generate_random_fields
 
 
 class ProximalOperator:
@@ -47,7 +52,7 @@ class ProximalOperator:
 
     def proximal_objective(self, kappa):
         """Calculate the proximal objective function value"""
-        solution_misfit = self.fem_problem.objective(kappa)
+        solution_misfit = 100* self.fem_problem.objective(kappa)
         kappa_misfit = 0.5 * np.sum((kappa - self.kappa_intermediate) ** 2)
         return kappa_misfit + self.step_size * solution_misfit
 
@@ -60,6 +65,7 @@ class ProximalOperator:
 
 def solve_inverse_problem_for_ukappa(
     ukappa,
+    ukappa_normalized,
     true_kappa,
     resolution=64,
     noise_level=0.01,
@@ -73,6 +79,7 @@ def solve_inverse_problem_for_ukappa(
     output_dir="figures/ukappa_inverse",
     idx=0,
     regularizer_type="denoiser",
+    regularizer_weights=None,
     p_norm=2,
     epsilon=1e-6,
     lambda_min_factor=0.1,  # Start lambda_reg at this fraction of initial_lambda_reg
@@ -86,17 +93,21 @@ def solve_inverse_problem_for_ukappa(
         true_kappa: The true conductivity field (for comparison), shape (resolution, resolution)
         resolution: Mesh resolution
         noise_level: Level of noise to add to the measurements
-        lambda_reg: Regularization strength
+        initial_lambda_reg: Regularization strength
+        initial_step_size: Initial step size for optimization
         denoiser_path: Path to the denoiser model
         norm_min: Minimum value for normalization
         norm_max: Maximum value for normalization
         plot_results: Whether to generate plots
         max_iterations: Maximum number of outer iterations
         output_dir: Directory to save results
-        regularizer_type: Type of regularizer to use (denoiser, value, gradient, tv)
+        idx: Index of the current sample
+        regularizer_type: Type of regularizer(s) to use - can be a single type or a comma-separated list
+        regularizer_weights: Optional weights for composite regularizer, comma-separated floats
         p_norm: p value for Lp norm when using value or gradient regularizer
+        epsilon: Smoothing parameter for TV regularizer
         lambda_min_factor: Initial lambda_reg as a fraction of initial_lambda_reg
-        lambda_schedule_iterations: Number of iterations over which lambda_reg increases
+        lambda_schedule_iterations: Number of iterations over which lambda increases
 
     Returns:
         dict: Results including errors and recovered fields
@@ -118,11 +129,13 @@ def solve_inverse_problem_for_ukappa(
     if noise_level > 0:
         noise = noise_level * np.linalg.norm(ukappa) * np.random.randn(ukappa.size)
         u_meas = ukappa + noise
+        u_meas_normalized = ukappa_normalized + noise
         # Ensure boundary conditions remain exact
         u_meas[fem_problem.dirichlet_nodes] = u_d[fem_problem.dirichlet_nodes]
+        u_meas_normalized[fem_problem.dirichlet_nodes] = u_d[fem_problem.dirichlet_nodes]
     else:
         u_meas = ukappa.copy()
-
+        u_meas_normalized = ukappa_normalized.copy()
     # Set the measured data as the target for inversion
     fem_problem.set_parameters(f=f, u_d=u_d, uhat=u_meas)
 
@@ -132,51 +145,101 @@ def solve_inverse_problem_for_ukappa(
     # Create the appropriate regularizer based on type
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    if regularizer_type == "denoiser":
-        # Load the denoiser model
-        denoiser = KappaDenoiser()
-        denoiser.load_state_dict(torch.load(denoiser_path, map_location=device))
-        denoiser.to(device)
-        denoiser.eval()
-
-        # Create the denoiser regularizer
-        regularizer = DenoiserRegularizer(
-            denoiser=denoiser,
-            lambda_reg=initial_lambda_reg,
-            device=device,
-            norm_min=norm_min,
-            norm_max=norm_max,
-        )
-        print(f"Using denoiser regularization with λ={initial_lambda_reg}")
-    elif regularizer_type == "value":
-        regularizer = ValueRegularizer(lambda_reg=initial_lambda_reg, p=p_norm)
-        print(f"Using value regularization with λ={initial_lambda_reg}, p={p_norm}")
-    elif regularizer_type == "gradient":
-        # Need dx and dy for gradient regularizer
-        dx = fem_problem.dx
-        dy = fem_problem.dy
-        regularizer = GradientRegularizer(
-            lambda_reg=initial_lambda_reg, dx=dx, dy=dy, p=p_norm
-        )
-        print(f"Using gradient regularization with λ={initial_lambda_reg}, p={p_norm}")
-    elif regularizer_type == "tv":
-        # Need dx and dy for total variation regularizer
-        dx = fem_problem.dx
-        dy = fem_problem.dy
-        regularizer = TotalVariationRegularizer(
-            lambda_reg=initial_lambda_reg, dx=dx, dy=dy, epsilon=epsilon
-        )
-        print(f"Using total variation regularization with λ={initial_lambda_reg}")
+    # Process regularizer types and weights
+    regularizer_types = regularizer_type.split(',')
+    regularizer_types = [r.strip() for r in regularizer_types]
+    
+    # Process weights if provided
+    if regularizer_weights:
+        weights = [float(w.strip()) for w in regularizer_weights.split(',')]
+        if len(weights) != len(regularizer_types):
+            raise ValueError(f"Number of weights ({len(weights)}) must match number of regularizers ({len(regularizer_types)})")
     else:
-        raise ValueError(f"Unknown regularizer type: {regularizer_type}")
+        # Equal weights if not specified
+        weights = [1.0] * len(regularizer_types)
+    
+    # Initialize list to hold individual regularizers
+    regularizers = []
+    
+    # Create each individual regularizer
+    for reg_type in regularizer_types:
+        if reg_type == "denoiser":
+            # Load the denoiser model
+            denoiser = KappaDenoiser()
+            denoiser.load_state_dict(torch.load(denoiser_path, map_location=device))
+            denoiser.to(device)
+            denoiser.eval()
+
+            # Create the denoiser regularizer
+            reg = DenoiserRegularizer(
+                denoiser=denoiser,
+                lambda_reg=initial_lambda_reg,  # Will be scaled by CompositeRegularizer
+                device=device,
+                norm_min=norm_min,
+                norm_max=norm_max,
+            )
+            print(f"Added denoiser regularization")
+            
+        elif reg_type == "value":
+            reg = ValueRegularizer(lambda_reg=initial_lambda_reg, p=p_norm)
+            print(f"Added value regularization with p={p_norm}")
+            
+        elif reg_type == "gradient":
+            # Need dx and dy for gradient regularizer
+            dx = fem_problem.dx
+            dy = fem_problem.dy
+            reg = GradientRegularizer(
+                lambda_reg=initial_lambda_reg, dx=dx, dy=dy, p=p_norm
+            )
+            print(f"Added gradient regularization with p={p_norm}")
+            
+        elif reg_type == "tv":
+            # Need dx and dy for total variation regularizer
+            dx = fem_problem.dx
+            dy = fem_problem.dy
+            reg = TotalVariationRegularizer(
+                lambda_reg=initial_lambda_reg, dx=dx, dy=dy, epsilon=epsilon
+            )
+            print(f"Added total variation regularization")
+            
+        else:
+            raise ValueError(f"Unknown regularizer type: {reg_type}")
+            
+        regularizers.append(reg)
+    
+    # Create the composite regularizer if multiple types are specified
+    if len(regularizers) > 1:
+        regularizer = CompositeRegularizer(
+            regularizers=regularizers,
+            weights=weights,
+            global_lambda_reg=initial_lambda_reg
+        )
+        print(f"Created composite regularizer with weights {weights} and initial λ={initial_lambda_reg}")
+    else:
+        # Single regularizer - apply initial_lambda_reg directly
+        regularizer = regularizers[0]
+        regularizer.update_lambda(initial_lambda_reg)
+        print(f"Using single {regularizer_types[0]} regularization with λ={initial_lambda_reg}")
 
     # reshape 2D fields to 1D arrays
     true_kappa = true_kappa.reshape(-1)
     ukappa = ukappa.reshape(-1)
+    
 
-    # Create an initial guess for kappa using random normal noise
-    kappa0 = np.random.randn(true_kappa.size)
-    kappa0 = np.maximum(kappa0, 0.1)  # ensure positivity
+    # Create an initial guess for kappa using KL expansion with FEM mesh
+    kappa0 = generate_kappa_initialization(
+        fem_problem=fem_problem,
+        mu_target=2.0,  # some guess for the dataset mean
+        sigma_target=0.2,  # some guess for the dataset std
+        correlation_length=None,  # Auto-calculate based on mesh size
+        error_threshold=1e-3
+    )
+    
+    # # convert kappa0 to the range of the dataset
+    # kappa0 = (kappa0 - kappa0.min()) / (kappa0.max() - kappa0.min()) * (norm_max - norm_min) + norm_min
+
+    # kappa0 = np.random.randn(true_kappa.size)
+    # kappa0 = np.maximum(kappa0, 0.1)
 
     # Set up iteration tracking
     iterations = []
@@ -223,13 +286,26 @@ def solve_inverse_problem_for_ukappa(
     prev_kappa = intermediate_kappa.copy()
     min_step_size = 1e-4
     step_size = initial_step_size
-    conv_tol = 1e-6
+    conv_tol = 1e-5
+
+    # Additional convergence criteria parameters
+    obj_conv_tol = 1e-4   # Tolerance for relative change in objective function
+    grad_norm_tol = 1e-4  # Tolerance for gradient norm
+    reg_conv_tol = 1e-4   # Tolerance for relative change in regularization value
+    window_size = 10       # Window size for moving average calculations
+    
+    # Tracking variables for convergence criteria
+    prev_objective = float('inf')
+    prev_reg_value = float('inf')
+    objective_rel_changes = []  # Track relative changes in objective
+    gradient_norms = []        # Track gradient norms
+    reg_rel_changes = []       # Track relative changes in regularization value
 
     # Step size adaptation parameters
     previous_objective = float("inf")
     objective_history = []  # Store last few objectives
     history_window = 3  # Number of iterations to consider for trends
-    patience = 10  # Iterations of increase before decreasing step size
+    patience = 30  # Iterations of increase before decreasing step size
     consecutive_increases = 0
     decrease_factor = 0.5  # Factor to decrease step size
     increase_factor = 1.1  # Factor to increase step size
@@ -258,13 +334,18 @@ def solve_inverse_problem_for_ukappa(
         # Apply regularization gradient step (without momentum)
         reg_gradient = regularizer.gradient(intermediate_kappa)
         intermediate_kappa = intermediate_kappa - step_size * reg_gradient
-        # ensure positivity
-        intermediate_kappa = np.maximum(intermediate_kappa, 1e-6)
 
         # Calculate regularization value for tracking and early stopping
         # This calculation happens before the proximal step to evaluate the current kappa
         current_reg_value = regularizer(intermediate_kappa)
         reg_values.append(current_reg_value)
+
+        # Calculate relative change in regularization value for convergence check
+        reg_rel_change = abs(current_reg_value - prev_reg_value) / (abs(prev_reg_value) + 1e-10)
+        reg_rel_changes.append(reg_rel_change)
+        if len(reg_rel_changes) > window_size:
+            reg_rel_changes.pop(0)
+        prev_reg_value = current_reg_value
 
         # Create and solve the proximal problem
         proximal_operator = ProximalOperator(intermediate_kappa, fem_problem, step_size)
@@ -275,7 +356,7 @@ def solve_inverse_problem_for_ukappa(
             jac=proximal_operator.proximal_gradient,
             callback=callback,
             options=options,
-            bounds=[(1e-6, None) for _ in range(intermediate_kappa.size)],
+            bounds=[(1e-3, None) for _ in range(intermediate_kappa.size)],
         )
 
         # Update kappa
@@ -285,41 +366,19 @@ def solve_inverse_problem_for_ukappa(
         # Get current objective value (use the last one from the callback)
         current_objective = objectives[-1] if objectives else float("inf")
 
-        # Update objective history (keep only the last `history_window` values)
-        objective_history.append(current_objective)
-        if len(objective_history) > history_window:
-            objective_history.pop(0)
+        # Calculate relative change in objective for convergence check
+        obj_rel_change = abs(current_objective - prev_objective) / (abs(prev_objective) + 1e-10)
+        objective_rel_changes.append(obj_rel_change)
+        if len(objective_rel_changes) > window_size:
+            objective_rel_changes.pop(0)
+        prev_objective = current_objective
 
-        # --- More Robust Adaptive Step Size Scheduler ---
-        if current_objective >= previous_objective:
-            consecutive_increases += 1
-            if consecutive_increases >= patience:
-                step_size = max(step_size * decrease_factor, min_step_size)
-                print(
-                    f"Objective increased for {patience} steps. Reducing step size to {step_size:.6e}"
-                )
-                consecutive_increases = 0  # Reset counter after decrease
-        else:
-            # Objective decreased, reset consecutive increase counter
-            consecutive_increases = 0
+        # Calculate gradient norm for gradient-based convergence check
+        current_gradient_norm = np.linalg.norm(proximal_operator.proximal_gradient(intermediate_kappa))
+        gradient_norms.append(current_gradient_norm)
+        if len(gradient_norms) > window_size:
+            gradient_norms.pop(0)
 
-            # Check for consistent decrease to potentially increase step size
-            if len(objective_history) == history_window and k > history_window:
-                # Check if all recent steps showed improvement
-                is_consistently_decreasing = all(
-                    objective_history[i] < objective_history[i - 1]
-                    for i in range(1, history_window)
-                )
-
-                if is_consistently_decreasing:
-                    new_step_size = min(step_size * increase_factor, max_step_size)
-                    if new_step_size > step_size:  # Only print if it actually increased
-                        step_size = new_step_size
-                        print(
-                            f"Consistent decrease observed. Increasing step size to {step_size:.6e}"
-                        )
-
-        previous_objective = current_objective
         # Update progress reporting
         print(
             f"Outer iteration {k + 1}, λ = {current_lambda:.4e}, step_size = {step_size:.4e}, "
@@ -327,10 +386,10 @@ def solve_inverse_problem_for_ukappa(
         )
 
         # function to create proper visualizations for wandb
-        def create_field_visualization(field_data, title, cmap="viridis"):
+        def create_field_visualization(field_data, title, cmap="viridis", vmin=None, vmax=None):
             """Create a matplotlib figure with colorbar for wandb logging"""
             fig, ax = plt.subplots(figsize=(8, 8))
-            im = ax.imshow(field_data, cmap=cmap)
+            im = ax.imshow(field_data, cmap=cmap, vmin=vmin, vmax=vmax)
             ax.set_title(title)
             fig.colorbar(im, ax=ax)
             return fig
@@ -343,19 +402,26 @@ def solve_inverse_problem_for_ukappa(
             true_kappa_reshaped = true_kappa.reshape(resolution, resolution)
             ukappa_reshaped = ukappa.reshape(resolution + 1, resolution + 1)
             u_recovered_reshaped = u_recovered.reshape(resolution + 1, resolution + 1)
-
+            ukappa_normalized_reshaped = ukappa_normalized.reshape(resolution + 1, resolution + 1)
+            
+            # Calculate common color scales
+            kappa_vmin = min(np.min(kappa_recovered), np.min(true_kappa_reshaped))
+            kappa_vmax = max(np.max(kappa_recovered), np.max(true_kappa_reshaped))
+            u_vmin = min(np.min(u_recovered_reshaped), np.min(ukappa_reshaped))
+            u_vmax = max(np.max(u_recovered_reshaped), np.max(ukappa_reshaped))
+            
             # Create proper visualizations with matplotlib
             kappa_recovered_fig = create_field_visualization(
-                kappa_recovered, "Recovered Kappa Field"
+                kappa_recovered, "Recovered Kappa Field", vmin=kappa_vmin, vmax=kappa_vmax
             )
             u_recovered_fig = create_field_visualization(
-                u_recovered_reshaped, "Recovered Solution Field"
+                u_recovered_reshaped, "Recovered Solution Field", vmin=u_vmin, vmax=u_vmax
             )
             true_kappa_fig = create_field_visualization(
-                true_kappa_reshaped, "True Kappa Field"
+                true_kappa_reshaped, "True Kappa Field", vmin=kappa_vmin, vmax=kappa_vmax
             )
             ukappa_fig = create_field_visualization(
-                ukappa_reshaped, "True Solution Field"
+                ukappa_reshaped, "True Solution Field", vmin=u_vmin, vmax=u_vmax
             )
 
             # Log the figures to wandb
@@ -374,11 +440,39 @@ def solve_inverse_problem_for_ukappa(
             plt.close(true_kappa_fig)
             plt.close(ukappa_fig)
 
-        if (
-            np.linalg.norm(intermediate_kappa - prev_kappa) / np.linalg.norm(prev_kappa)
-            < conv_tol
-        ):
+        # Calculate average metrics over the window for smoother convergence detection
+        avg_obj_rel_change = np.mean(objective_rel_changes) if objective_rel_changes else float('inf')
+        avg_gradient_norm = np.mean(gradient_norms) if gradient_norms else float('inf')
+        avg_reg_rel_change = np.mean(reg_rel_changes) if reg_rel_changes else float('inf')
+        
+        # Original criterion: relative change in kappa
+        kappa_rel_change = np.linalg.norm(intermediate_kappa - prev_kappa) / (np.linalg.norm(prev_kappa) + 1e-10)
+        
+        # Log all convergence metrics
+        print(
+            f"Convergence metrics: kappa_change = {kappa_rel_change:.4e}, "
+            f"obj_change = {avg_obj_rel_change:.4e}, grad_norm = {avg_gradient_norm:.4e}, "
+            f"reg_change = {avg_reg_rel_change:.4e}"
+        )
+        
+        # Composite convergence check
+        conv_criteria_met = (
+            (kappa_rel_change < conv_tol) or  # Original criterion
+            (avg_obj_rel_change < obj_conv_tol and k > window_size) or  # Objective stabilized
+            (avg_gradient_norm < grad_norm_tol and k > window_size) or  # Gradient small
+            (avg_reg_rel_change < reg_conv_tol and k > window_size * 2)  # Regularization stabilized
+        )
+        
+        if conv_criteria_met:
             print(f"Convergence achieved at iteration {k}")
+            if kappa_rel_change < conv_tol:
+                print("  Converged based on change in kappa")
+            if avg_obj_rel_change < obj_conv_tol and k > window_size:
+                print("  Converged based on objective function stability")
+            if avg_gradient_norm < grad_norm_tol and k > window_size:
+                print("  Converged based on gradient norm")
+            if avg_reg_rel_change < reg_conv_tol and k > window_size * 2:
+                print("  Converged based on regularization value stability")
             break
 
     # Get the recovered conductivity (use the one with the best regularization value)
@@ -408,6 +502,7 @@ def solve_inverse_problem_for_ukappa(
     print(f"Relative L2 error in solution u: {u_error_rel:.6e}")
     print(f"L2 error in solution u: {u_error_l2:.6e}")
     print(f"L2 error in solution u w/ noise: {u_error_l2_meas:.6e}")
+
 
     # Plot results if requested
     if plot_results:
@@ -508,6 +603,98 @@ def solve_inverse_problem_for_ukappa(
     }
 
 
+def generate_kappa_initialization(fem_problem, mu_target=2.7, sigma_target=0.3, correlation_length=None, error_threshold=1e-3):
+    """
+    Generate a non-Gaussian random field using KL expansion for kappa initialization.
+    Uses the mesh coordinates from the FEM problem.
+    
+    Parameters:
+    -----------
+    fem_problem : FEMProblem
+        The FEM problem with mesh coordinates
+    mu_target : float
+        Target mean for the conductivity field (default: 2.7)
+    sigma_target : float
+        Target standard deviation for the conductivity field (default: 0.3)
+    correlation_length : float
+        Correlation length for the random field. If None, calculated as 8*dx
+    error_threshold : float
+        Error threshold for truncating the KL expansion
+        
+    Returns:
+    --------
+    kappa : np.ndarray
+        Random field initialization for kappa
+    """
+    from scipy.spatial.distance import pdist, squareform
+    
+    # Get element coordinates for random field generation
+    elem_coords = fem_problem.mesh.get_element_coordinates(np.arange(fem_problem.num_elements))
+    elem_coords = np.array(elem_coords)
+    
+    # Calculate centroids of elements
+    x_elem = np.mean(elem_coords[0], axis=0)
+    y_elem = np.mean(elem_coords[1], axis=0)
+    
+    # Create coordinates array for distance calculation
+    xy_coords = np.column_stack((x_elem, y_elem))
+    
+    # Set correlation length based on mesh size if not provided
+    if correlation_length is None:
+        correlation_length = 8 * fem_problem.dx
+    
+    print(f"Using correlation length of {correlation_length:.4f} for kappa initialization")
+    
+    # Calculate covariance matrix using exponential kernel
+    distances = squareform(pdist(xy_coords, "euclidean"))
+    cov_matrix = np.exp(-distances / correlation_length)
+    
+    # Compute KL decomposition
+    eig_vals, eig_vecs = np.linalg.eigh(cov_matrix)
+    
+    # Sort in descending order
+    idx = np.argsort(eig_vals)[::-1]
+    eig_vals = np.abs(eig_vals[idx])  # Ensure positive eigenvalues
+    eig_vecs = eig_vecs[:, idx]
+    
+    # Calculate error function and truncate
+    error_func = 1 - (np.cumsum(eig_vals) / np.sum(eig_vals))
+    n_truncate = np.argwhere(error_func <= error_threshold)[0][0] + 1
+    
+    print(f"Truncated KL expansion to {n_truncate} components")
+    
+    # Use only truncated eigenvalues and eigenvectors
+    eig_vals = eig_vals[:n_truncate]
+    eig_vecs = eig_vecs[:, :n_truncate]
+    
+    # Parameters for standard normal
+    mu_gauss = 0
+    sigma_gauss = 1
+    
+    # Parameters for target gamma distribution
+    beta = 1 / np.power(sigma_target, 2)
+    alpha = mu_target * np.power(sigma_target, 2)
+    
+    # Create sqrt of eigenvalue diagonal matrix
+    sqrt_eig_vals = np.sqrt(eig_vals)
+    
+    # Generate standard normal random variables
+    xi = np.random.normal(mu_gauss, sigma_gauss, n_truncate)
+    
+    # Compute KL expansion to obtain Gaussian field realization
+    gaussian_field = mu_gauss + sigma_gauss * eig_vecs @ (sqrt_eig_vals * xi)
+    
+    # Transform to non-Gaussian field using gamma distribution
+    # Apply the probability integral transform: Standard normal CDF -> gamma PPF
+    z_normcdf = stats.norm.cdf(gaussian_field, mu_gauss, sigma_gauss)
+    kappa = stats.gamma.ppf(z_normcdf, beta, scale=alpha)
+    
+    # Ensure strict positivity
+    kappa = np.maximum(kappa, 1e-6)
+    
+    return kappa
+
+
 def main():
     """Main function to parse arguments and run the inverse problem solver"""
     parser = argparse.ArgumentParser(
@@ -560,8 +747,13 @@ def main():
         "--regularizer",
         type=str,
         default="denoiser",
-        choices=["denoiser", "value", "gradient", "tv"],
-        help="Type of regularizer to use",
+        help="Type of regularizer(s) to use, comma-separated for multiple (denoiser,tv,value,gradient)",
+    )
+    parser.add_argument(
+        "--regularizer_weights",
+        type=str,
+        default=None,
+        help="Comma-separated weights for regularizers (must match number of regularizers)",
     )
     parser.add_argument(
         "--p_norm",
@@ -621,14 +813,22 @@ def main():
 
     # Download ukappa dataset from wandb
     print(
-        f"Downloading ukappa_{args.resolution}x{args.resolution}-{args.dataset_type} dataset..."
+        f"Downloading ukappa_dataset_{args.resolution}x{args.resolution}-{args.dataset_type} dataset..."
     )
     ukappa_artifact = wandb.use_artifact(
         f"ECE689AdvDL/DIPDE/ukappa_dataset_{args.resolution}x{args.resolution}-{args.dataset_type}:latest"
     )
     ukappa_dir = Path(ukappa_artifact.download())
-    ukappa_path = list(ukappa_dir.glob("*.npy"))[0]
+    ukappa_path = list(ukappa_dir.glob("*dataset.npy"))[0]
     ukappa_dataset = np.load(ukappa_path)
+    
+    print(f"Downloading ukappa_dataset_normalized_{args.resolution}x{args.resolution}-{args.dataset_type} dataset...")
+    ukappa_artifact_normalized = wandb.use_artifact(
+        f"ECE689AdvDL/DIPDE/ukappa_dataset_normalized_{args.resolution}x{args.resolution}-{args.dataset_type}:latest"
+    )
+    ukappa_dir_normalized = Path(ukappa_artifact_normalized.download())
+    ukappa_path_normalized = list(ukappa_dir_normalized.glob("*dataset_normalized.npy"))[0]
+    ukappa_dataset_normalized = np.load(ukappa_path_normalized)
 
     # Download kappa fields for ground truth
     print(f"Downloading test kappa field dataset...")
@@ -658,13 +858,14 @@ def main():
         reshape_size=(args.resolution, args.resolution),
     )
 
-    kappa_fields_train = dataset_train.clean_fields.numpy()
-    kappa_fields_test = dataset_test.clean_fields.numpy()
+    # Get clean kappa fields, note !Unnormalized!
+    kappa_fields_train = dataset_train.clean_fields_original.numpy()
+    kappa_fields_test = dataset_test.clean_fields_original.numpy()
 
     # Get normalization statistics for the denoiser
-    norm_min = kappa_fields_train.min().item()
-    norm_max = kappa_fields_train.max().item()
-    print(f"Normalization range: [{norm_min}, {norm_max}]")
+    norm_min = dataset_train.norm_min
+    norm_max = dataset_train.norm_max
+    print(f"Range of training kappa fields: [{kappa_fields_train.min()}, {kappa_fields_train.max()}]")
 
     # Ensure we dont request more samples than available
     assert args.num_samples <= len(ukappa_dataset), (
@@ -698,6 +899,7 @@ def main():
 
         # Get ukappa and corresponding true kappa (adapt based on dataset type if needed)
         ukappa = ukappa_dataset[idx]
+        ukappa_normalized = ukappa_dataset_normalized[idx]
         # Assuming test set kappa is the primary target for inversion comparison
         true_kappa = kappa_fields_test[idx]
 
@@ -705,21 +907,11 @@ def main():
         sample_figure_dir = os.path.join(figures_dir, f"sample_{idx}")
         # No need to create - solve_inverse_problem_for_ukappa will handle if plot_results is True
 
-        # --- Save initial true fields (optional, consider if needed besides wandb/plots) ---
-        # true_kappa_reshaped = true_kappa.reshape(args.resolution, args.resolution)
-        # ukappa_reshaped = ukappa.reshape(args.resolution + 1, args.resolution + 1)
-        # initial_figs_dir = os.path.join(sample_figure_dir, "initial_fields")
-        # os.makedirs(initial_figs_dir, exist_ok=True)
-        # plt.imsave(
-        #     os.path.join(initial_figs_dir, f"true_kappa_{idx}.png"), true_kappa_reshaped
-        # )
-        # plt.imsave(os.path.join(initial_figs_dir, f"ukappa_{idx}.png"), ukappa_reshaped)
-        # -----------------------------------------------------------------------------
-
         # Solve the inverse problem
         # Pass the sample-specific figure directory
         results = solve_inverse_problem_for_ukappa(
             ukappa=ukappa,
+            ukappa_normalized=ukappa_normalized,
             true_kappa=true_kappa,
             resolution=args.resolution,
             noise_level=args.noise,
@@ -733,6 +925,7 @@ def main():
             output_dir=sample_figure_dir,  # Use the dedicated figure dir
             idx=idx,
             regularizer_type=args.regularizer,
+            regularizer_weights=args.regularizer_weights,
             p_norm=args.p_norm,
             lambda_min_factor=args.lambda_min_factor,
             lambda_schedule_iterations=args.lambda_schedule_iterations,
@@ -800,7 +993,8 @@ def main():
         "initial_step_size": args.initial_step_size,
         "num_samples_processed": num_samples,
         "regularizer_type": args.regularizer,
-        "p_norm": args.p_norm if args.regularizer in ["value", "gradient"] else None,
+        "regularizer_weights": args.regularizer_weights,
+        "p_norm": args.p_norm if "value" in args.regularizer or "gradient" in args.regularizer else None,
         "max_iterations_allowed": args.max_iterations,
         "lambda_min_factor": args.lambda_min_factor,
         "lambda_schedule_iterations": args.lambda_schedule_iterations,
