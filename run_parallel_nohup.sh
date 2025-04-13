@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Number of threads for each process (half of the total 128)
-N_THREADS=64
+# Number of threads for each process (3/4 of the total 128)
+N_THREADS=96
 
 # Log file to store PIDs and their corresponding output files
 PID_LOG="pids.log"
@@ -25,9 +25,19 @@ pid_TV=$!
 echo "TV process started with PID: $pid_TV. Output logged to $LOG_TV"
 echo "PID_TV: $pid_TV, Log: $LOG_TV" >> $PID_LOG
 
+# --- Run denoiser script ---
+LOG_DENOISER="log_denoiser.out"
+echo "Starting ukappa_inverse_problem_denoiser.sh..."
+# Execute in a subshell to set OMP_NUM_THREADS, redirect output, run in background
+nohup bash -c 'export OMP_NUM_THREADS=$0; bash ukappa_inverse_problem_denoiser.sh' "$N_THREADS" > "$LOG_DENOISER" 2>&1 &
+pid_DENOISER=$!
+echo "Denoiser process started with PID: $pid_DENOISER. Output logged to $LOG_DENOISER"
+echo "PID_DENOISER: $pid_DENOISER, Log: $LOG_DENOISER" >> $PID_LOG
+
+# --- Print summary ---
 echo "---"
-echo "Both scripts launched in the background using nohup."
-echo "Check $LOG_L2 and $LOG_TV for output."
+echo "All scripts launched in the background using nohup."
+echo "Check $LOG_L2 and $LOG_TV and $LOG_DENOISER for output."
 echo "Check $PID_LOG for process IDs and log file mapping."
-echo "You can monitor the processes using 'ps -p $pid_L2,$pid_TV' or 'htop'."
-echo "To terminate a process, use 'kill $pid_L2' or 'kill $pid_TV'."
+echo "You can monitor the processes using 'ps -p $pid_L2,$pid_TV,$pid_DENOISER' or 'htop'."
+echo "To terminate a process, use 'kill $pid_L2' or 'kill $pid_TV' or 'kill $pid_DENOISER'."
