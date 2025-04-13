@@ -123,19 +123,25 @@ Solve an inverse problem using different regularization techniques:
 
 ### Inverse Problem Solving
 
-Run the inverse problem solver with custom parameters:
+Run the inverse problem solver with custom parameters, example:
 
 ```bash
 python -m src.ukappa_inverse_problem \
-    --noise 0.01 \                   # Noise level for measurement data
-    --num_samples 5 \                # Number of samples to process
-    --max_iterations 500 \           # Maximum optimization iterations
-    --initial_step_size 1.0 \        # Initial optimization step size
-    --initial_lambda_reg 0.1 \       # Initial regularization strength
-    --lambda_min_factor 0.1 \        # Min regularization as fraction of initial
-    --lambda_schedule_iterations 50 \ # Iterations for lambda schedule
-    --regularizer denoiser \         # Regularizer type (denoiser, tv, value, gradient)
-    --p_norm 2                       # p-norm value (for value/gradient regularizers)
+--noise 0.01 \                   # Noise level for measurement data
+--resolution 64 \                # Mesh resolution
+--num_samples 5 \                # Number of samples to process
+--max_iterations 500 \           # Maximum optimization iterations
+--initial_step_size 10000.0 \        # Initial optimization step size
+--initial_lambda_reg 0.000008 \       # Initial regularization strength
+--lambda_min_factor 1 \          # Min regularization as fraction of initial, 1 for no decay
+--lambda_schedule_iterations 50 \ # Iterations for lambda schedule
+--regularizer denoiser \         # Regularizer type (denoiser, tv, value, gradient)
+--regularizer_weights 1.0 \      # Optional weights for multiple regularizers (comma-separated)
+--p_norm 2.0 \                   # p-norm value (for value/gradient regularizers)
+--epsilon 1e-6 \                 # Smoothing parameter for TV regularizer
+--seed 42 \                      # Random seed for reproducibility
+--dataset_type test \            # Dataset type to use (train, val, test)
+--base_output_dir results/ukappa_inverse # Base directory for saving results
 ```
 
 ## Example Results
@@ -169,22 +175,23 @@ Results are saved in the `figures/` and `results/` directories.
 
 The main script `src/ukappa_inverse_problem.py` accepts the following important parameters:
 
-- `--noise`: Noise level to add to the measurements (fraction of signal L2 norm).
-- `--resolution`: Mesh resolution (e.g., 64 for a 64x64 grid).
-- `--num_samples`: Number of samples from the dataset to process.
-- `--max_iterations`: Maximum number of outer optimization iterations.
-- `--initial_step_size`: Initial step size for the alternating minimization optimization.
-- `--initial_lambda_reg`: Initial regularization strength (lambda).
-- `--lambda_min_factor`: The final regularization strength lambda will decay to, as a fraction of the initial value.
-- `--lambda_schedule_iterations`: Number of iterations over which lambda decreases linearly from the initial value to the minimum value.
-- `--regularizer`: Type of regularizer (`denoiser`, `tv`, `value`, `gradient`).
-- `--p_norm`: The p-value for the Lp norm when using `value` or `gradient` regularizers (default: 2).
-- `--epsilon`: Smoothing parameter for the Total Variation (TV) regularizer (default: 1e-6).
+- `--noise`: Noise level to add to the measurements (fraction of signal L2 norm). Default: 0.01.
+- `--resolution`: Mesh resolution (e.g., 64 for a 64x64 grid). Default: 64.
+- `--num_samples`: Number of samples from the dataset to process. Default: 5.
+- `--max_iterations`: Maximum number of outer optimization iterations. Default: 100.
+- `--initial_step_size`: Initial step size for the alternating minimization optimization. Default: 1.0.
+- `--initial_lambda_reg`: Initial regularization strength (lambda). Default: 0.1.
+- `--lambda_min_factor`: The minimum lambda value as a fraction of the initial value. Default: 0.1.
+- `--lambda_schedule_iterations`: Number of iterations over which lambda decreases linearly. Default: 50.
+- `--regularizer`: Type of regularizer(s) to use, comma-separated for multiple. Options: `denoiser`, `tv`, `value`, `gradient`. Default: `denoiser`.
+- `--regularizer_weights`: Comma-separated weights for multiple regularizers (must match number of regularizers). Default: Equal weights.
+- `--p_norm`: The p-value for the Lp norm when using `value` or `gradient` regularizers. Default: 2.0.
+- `--epsilon`: Smoothing parameter for the Total Variation (TV) regularizer. Default: 1e-6.
 - `--denoiser_path`: Path to the pre-trained denoiser model file (required if `regularizer` is `denoiser`).
-- `--base_output_dir`: Base directory where run-specific output folders (named by wandb run ID) will be created.
-- `--seed`: Random seed for reproducibility.
-- `--dataset_type`: Which dataset split to use (`train`, `val`, `test`).
-- `--no_plot`: Flag to disable generating and saving plots.
+- `--base_output_dir`: Base directory where run-specific output folders (named by wandb run ID) will be created. Default: `results/ukappa_inverse`.
+- `--seed`: Random seed for reproducibility. Default: 42.
+- `--dataset_type`: Which dataset split to use. Options: `train`, `val`, `test`. Default: `test`.
+- `--no_plot`: Flag to disable generating and saving plots. Default: Plots enabled.
 
 ## License
 
