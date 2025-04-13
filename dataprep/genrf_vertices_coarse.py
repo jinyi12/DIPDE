@@ -104,7 +104,7 @@ def compute_covariance_matrix(
     distances = squareform(pdist(coords, "euclidean"))
 
     # Exponential kernel
-    cov_matrix = sigma * np.exp(-distances / correlation_length)
+    cov_matrix = (sigma**2) * np.exp(-distances / correlation_length)
 
     return cov_matrix
 
@@ -243,7 +243,7 @@ def generate_random_fields(
         xi = np.random.normal(mu_gauss, sigma_gauss, n_kl)
 
         # Compute KL expansion to obtain Gaussian field realization
-        gaussian = mu_gauss + sigma_gauss * eig_vecs @ sqrt_eig_vals_diag @ xi
+        gaussian = mu_gauss + eig_vecs @ sqrt_eig_vals_diag @ xi
 
         # Non-linear transformation to obtain non-Gaussian (conductivity) field
         # Apply the probability integral transform: Standard normal CDF -> gamma PPF
