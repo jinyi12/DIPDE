@@ -129,13 +129,13 @@ def solve_inverse_problem_for_ukappa(
     if noise_level > 0:
         noise = noise_level * np.linalg.norm(ukappa) * np.random.randn(ukappa.size)
         u_meas = ukappa + noise
-        u_meas_normalized = ukappa_normalized + noise
+        # u_meas_normalized = ukappa_normalized + noise
         # Ensure boundary conditions remain exact
         u_meas[fem_problem.dirichlet_nodes] = u_d[fem_problem.dirichlet_nodes]
-        u_meas_normalized[fem_problem.dirichlet_nodes] = u_d[fem_problem.dirichlet_nodes]
+        # u_meas_normalized[fem_problem.dirichlet_nodes] = u_d[fem_problem.dirichlet_nodes]
     else:
         u_meas = ukappa.copy()
-        u_meas_normalized = ukappa_normalized.copy()
+        # u_meas_normalized = ukappa_normalized.copy()
     # Set the measured data as the target for inversion
     fem_problem.set_parameters(f=f, u_d=u_d, uhat=u_meas)
 
@@ -244,7 +244,12 @@ def solve_inverse_problem_for_ukappa(
     # Set up iteration tracking
     iterations = []
     objectives = []
-    kappa_errors = []
+    u_kappa_l2_errors = []
+    u_meas_l2_errors = []
+    u_kappa_rel_l2_errors = []
+    u_meas_rel_l2_errors = []
+    kappa_l2_errors = []
+    kappa_rel_l2_errors = []
     reg_values = []  # Track regularization values
 
     def callback(xk):
@@ -258,20 +263,38 @@ def solve_inverse_problem_for_ukappa(
 
         objective = kappa_misfit + step_size * solution_misfit
 
-        error = np.linalg.norm(kappa_current - true_kappa) / np.linalg.norm(true_kappa)
+        kappa_l2_error = np.linalg.norm(kappa_current - true_kappa)
+        kappa_rel_l2_error = kappa_l2_error / np.linalg.norm(true_kappa)
+
+        u_kappa_current = fem_problem.forward(kappa_current)
+        u_kappa_l2_error = np.linalg.norm(u_kappa_current - ukappa) # L2 error in estimated solution and true solution
+        u_meas_l2_error = np.linalg.norm(u_kappa_current - u_meas) # L2 error in estimated solution and measured solution
+        u_kappa_rel_l2_error = np.linalg.norm(u_kappa_current - ukappa) / np.linalg.norm(u_kappa_current) # relative L2 error in estimated solution and true solution
+        u_meas_rel_l2_error = np.linalg.norm(u_kappa_current - u_meas) / np.linalg.norm(u_meas) # relative L2 error in estimated solution and measured solution
 
         print(
             f"Iteration {iter_num}: objective = {objective:.6e}, "
-            f"relative error in kappa = {error:.6e}"
+            f"relative L2 error in kappa = {kappa_rel_l2_error:.6e}, "
+            f"relative L2 error in u_meas = {u_meas_rel_l2_error:.6e}"
         )
+        
+        # objective
         objectives.append(objective)
-        kappa_errors.append(error)
+        
+        # kappa errors  
+        kappa_l2_errors.append(kappa_l2_error)
+        kappa_rel_l2_errors.append(kappa_rel_l2_error)
+        
+        # u errors
+        u_kappa_l2_errors.append(u_kappa_l2_error)
+        u_meas_l2_errors.append(u_meas_l2_error)
+        u_kappa_rel_l2_errors.append(u_kappa_rel_l2_error)
+        u_meas_rel_l2_errors.append(u_meas_rel_l2_error)
 
     # Optimization parameters
     options = {
         "maxiter": 3,
         "disp": True,
-        # "return_all": True,
         "c1": 0.001,
         "c2": 0.9,
     }
@@ -284,10 +307,9 @@ def solve_inverse_problem_for_ukappa(
     k_max = max_iterations
     intermediate_kappa = kappa0.copy()
     prev_kappa = intermediate_kappa.copy()
-    min_step_size = 1e-4
+    # min_step_size = 1e-4
     step_size = initial_step_size
     conv_tol = 1e-5
-
     # Additional convergence criteria parameters
     obj_conv_tol = 5e-4   # Tolerance for relative change in objective function
     grad_norm_tol = 5e-4  # Tolerance for gradient norm
@@ -402,7 +424,7 @@ def solve_inverse_problem_for_ukappa(
             true_kappa_reshaped = true_kappa.reshape(resolution, resolution)
             ukappa_reshaped = ukappa.reshape(resolution + 1, resolution + 1)
             u_recovered_reshaped = u_recovered.reshape(resolution + 1, resolution + 1)
-            ukappa_normalized_reshaped = ukappa_normalized.reshape(resolution + 1, resolution + 1)
+            # ukappa_normalized_reshaped = ukappa_normalized.reshape(resolution + 1, resolution + 1)
             
             # Calculate common color scales
             kappa_vmin = min(np.min(kappa_recovered), np.min(true_kappa_reshaped))
@@ -486,24 +508,27 @@ def solve_inverse_problem_for_ukappa(
         )
 
     end_time = time.perf_counter()
-    print(f"Optimization completed in {end_time - start_time:.2f} seconds")
+    total_optimization_time = (end_time - start_time)
+    print(f"Optimization completed in {total_optimization_time:.2f} seconds")
 
     # Compute final error
-    rel_error = np.linalg.norm(kappa_recovered - true_kappa) / np.linalg.norm(
-        true_kappa
-    )
-    print(f"Final relative L2 error in kappa: {rel_error:.6e}")
+    kappa_final_l2_error = np.linalg.norm(kappa_recovered - true_kappa)
+    kappa_final_rel_l2_error = kappa_final_l2_error / np.linalg.norm(true_kappa)
+    print(f"Final relative L2 error in kappa: {kappa_final_rel_l2_error:.6e}")
+    print(f"Final L2 error in kappa: {kappa_final_l2_error:.6e}")
 
     # Compute forward solution with recovered kappa
     u_recovered = fem_problem.forward(kappa_recovered)
-    u_error_rel = np.linalg.norm(u_recovered - ukappa) / np.linalg.norm(ukappa)
-    u_error_l2 = np.linalg.norm(u_recovered - ukappa)
-    u_error_l2_meas = np.linalg.norm(u_recovered - u_meas)
-    print(f"Relative L2 error in solution u: {u_error_rel:.6e}")
-    print(f"L2 error in solution u: {u_error_l2:.6e}")
-    print(f"L2 error in solution u w/ noise: {u_error_l2_meas:.6e}")
-
-
+    u_error_final_l2 = np.linalg.norm(u_recovered - ukappa)
+    u_error_final_rel_l2 = u_error_final_l2 / np.linalg.norm(ukappa)
+    u_error_final_l2_meas = np.linalg.norm(u_recovered - u_meas)    
+    u_error_final_rel_l2_meas = u_error_final_l2_meas / np.linalg.norm(u_meas)
+    
+    print(f"Relative L2 error in solution u: {u_error_final_rel_l2:.6e}")
+    print(f"L2 error in solution u: {u_error_final_l2:.6e}")
+    print(f"Relative L2 error in solution u w/ noise: {u_error_final_rel_l2_meas:.6e}")
+    print(f"L2 error in solution u w/ noise: {u_error_final_l2_meas:.6e}")
+    
     # Plot results if requested
     if plot_results:
         os.makedirs(output_dir, exist_ok=True)
@@ -531,7 +556,7 @@ def solve_inverse_problem_for_ukappa(
 
         # Recovered kappa
         im3 = axes[2].tricontourf(x_elem, y_elem, kappa_recovered, 20, cmap="viridis")
-        axes[2].set_title(f"Recovered Kappa (Error: {rel_error:.2%})")
+        axes[2].set_title(f"Recovered Kappa (Error: {kappa_final_rel_l2_error:.2%})")
         fig.colorbar(im3, ax=axes[2])
 
         for ax in axes:
@@ -553,7 +578,7 @@ def solve_inverse_problem_for_ukappa(
         titles = [
             "True Solution",
             f"Measurements (Noise: {noise_level:.2%})",
-            f"Recovered Solution (Error: {u_error_rel:.2%})"
+            f"Recovered Solution (Error: {u_error_final_rel_l2:.2%})"
         ]
         
         # Determine common color limits for solutions
@@ -591,7 +616,7 @@ def solve_inverse_problem_for_ukappa(
         axes[0].set_ylabel("Objective Value")
         axes[0].set_title("Convergence of Objective Function")
 
-        axes[1].semilogy(iterations, kappa_errors, "o-")
+        axes[1].semilogy(iterations, kappa_rel_l2_errors, "o-")
         axes[1].grid(True)
         axes[1].set_xlabel("Iteration")
         axes[1].set_ylabel("Relative Error in κ")
@@ -602,18 +627,29 @@ def solve_inverse_problem_for_ukappa(
 
     # Return results
     return {
-        "kappa_true": true_kappa,
-        "kappa_recovered": kappa_recovered,
-        "kappa_error": rel_error,
-        "ukappa_true": ukappa,
-        "ukappa_measured": u_meas,
-        "ukappa_recovered": u_recovered,
-        "ukappa_error": u_error_rel,
-        "iterations": len(iterations),
-        "objectives": objectives,
-        "kappa_errors": kappa_errors,
-        "reg_values": reg_values,
-        "best_reg_value": best_reg_value,
+        "kappa_true": true_kappa, # true kappa
+        "kappa_recovered": kappa_recovered, # recovered kappa
+        "kappa_final_rel_error": kappa_final_rel_l2_error, # relative L2 error in kappa
+        "ukappa_true": ukappa, # true solution
+        "ukappa_measured": u_meas, # measured solution
+        "ukappa_recovered": u_recovered, # recovered solution
+        # --- Final Errors ---
+        "ukappa_recovered_rel_error": u_error_final_rel_l2, # relative L2 error in recovered solution and true solution
+        "ukappa_recovered_rel_error_meas": u_error_final_rel_l2_meas, # relative L2 error in recovered solution and measured solution
+        # --- Iterate Errors ---
+        "ukappa_iterates_error": u_kappa_l2_errors, # L2 error in recovered solution and true solution at each iteration
+        "ukappa_iterates_error_meas": u_meas_l2_errors, # L2 error in recovered solution and measured solution at each iteration 
+        "ukappa_iterates_rel_errors": u_kappa_rel_l2_errors, # relative L2 error in recovered solution and true solution at each iteration
+        "ukappa_iterates_errors": u_kappa_l2_errors, # L2 error in recovered solution and true solution at each iteration
+        "ukappa_iterates_rel_errors_meas": u_meas_rel_l2_errors, # relative L2 error in recovered solution and measured solution at each iteration
+        "ukappa_iterates_errors_meas": u_meas_l2_errors, # L2 error in recovered solution and measured solution at each iteration
+        "kappa_iterates_rel_errors": kappa_rel_l2_errors, # relative L2 error in kappa at each iteration
+        # --- Iteration Metrics ---
+        "iterations": len(iterations), # number of iterations
+        "total_optimization_time": total_optimization_time, # total optimization time
+        "objectives": objectives, # objective values at each iteration
+        "reg_values": reg_values, # regularization values at each iteration
+        "best_reg_value": best_reg_value, # best regularization value
     }
 
 
@@ -946,25 +982,15 @@ def main():
             epsilon=args.epsilon,
         )
 
-        # Store results for the consolidated npz file
+        # Store all results for the consolidated npz file
         # Use str(idx) as key because np.savez requires string keys
-        consolidated_npz_data[str(idx)] = {
-            "kappa_true": results["kappa_true"],
-            "kappa_recovered": results["kappa_recovered"],
-            "ukappa_true": results["ukappa_true"],
-            "ukappa_measured": results["ukappa_measured"],
-            "ukappa_recovered": results["ukappa_recovered"],
-            # Add other numerical arrays if needed, e.g., objectives, errors per iteration
-            "objectives": results["objectives"],
-            "kappa_errors_iter": results["kappa_errors"],
-            "reg_values": results["reg_values"],
-        }
+        consolidated_npz_data[str(idx)] = results
 
         # Log individual sample metrics to wandb
         wandb.log(
             {
-                f"sample_{idx}/kappa_error_final": results["kappa_error"],
-                f"sample_{idx}/ukappa_error_final": results["ukappa_error"],
+                f"sample_{idx}/kappa_error_final": results["kappa_final_rel_error"],
+                f"sample_{idx}/ukappa_error_final": results["ukappa_recovered_rel_error"],
                 f"sample_{idx}/iterations": results["iterations"],
             }
         )
@@ -973,8 +999,8 @@ def main():
         all_summary_results.append(
             {
                 "index": idx,
-                "kappa_error": results["kappa_error"],
-                "ukappa_error": results["ukappa_error"],
+                "kappa_error": results["kappa_final_rel_error"],
+                "ukappa_error": results["ukappa_recovered_rel_error"],
                 "iterations": results["iterations"],
             }
         )
@@ -995,21 +1021,28 @@ def main():
     # --------------------------------------
 
     # Compute and log summary statistics
-    kappa_errors = [r["kappa_error"] for r in all_summary_results]
-    ukappa_errors = [r["ukappa_error"] for r in all_summary_results]
-    iterations = [r["iterations"] for r in all_summary_results]
+    kappa_errors_samples = [r["kappa_final_rel_error"] for r in all_summary_results]
+    ukappa_errors_samples = [r["ukappa_recovered_rel_error"] for r in all_summary_results]
+    iterations_samples = [r["iterations"] for r in all_summary_results]
+    times_samples = [r["total_optimization_time"] for r in all_summary_results]
 
     summary = {
-        "mean_kappa_error": np.mean(kappa_errors),
-        "std_kappa_error": np.std(kappa_errors),
-        "min_kappa_error": np.min(kappa_errors),
-        "max_kappa_error": np.max(kappa_errors),
-        "mean_ukappa_error": np.mean(ukappa_errors),
-        "std_ukappa_error": np.std(ukappa_errors),
-        "min_ukappa_error": np.min(ukappa_errors),
-        "max_ukappa_error": np.max(ukappa_errors),
-        "mean_iterations": np.mean(iterations),
-        "std_iterations": np.std(iterations),
+        "mean_kappa_error": np.mean(kappa_errors_samples),
+        "std_kappa_error": np.std(kappa_errors_samples),
+        "min_kappa_error": np.min(kappa_errors_samples),
+        "max_kappa_error": np.max(kappa_errors_samples),
+        "mean_ukappa_error": np.mean(ukappa_errors_samples),
+        "std_ukappa_error": np.std(ukappa_errors_samples),
+        "min_ukappa_error": np.min(ukappa_errors_samples),
+        "max_ukappa_error": np.max(ukappa_errors_samples),
+        "mean_iterations": np.mean(iterations_samples),
+        "std_iterations": np.std(iterations_samples),
+        "min_iterations": np.min(iterations_samples),
+        "max_iterations": np.max(iterations_samples),
+        "mean_time": np.mean(times_samples),
+        "std_time": np.std(times_samples),
+        "min_time": np.min(times_samples),
+        "max_time": np.max(times_samples),
         "noise_level": args.noise,
         "initial_lambda_reg": args.initial_lambda_reg,
         "initial_step_size": args.initial_step_size,
@@ -1020,6 +1053,7 @@ def main():
         "max_iterations_allowed": args.max_iterations,
         "lambda_min_factor": args.lambda_min_factor,
         "lambda_schedule_iterations": args.lambda_schedule_iterations,
+        "epsilon": args.epsilon,
     }
 
     print("\nSummary Statistics:")
