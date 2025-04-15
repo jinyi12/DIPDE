@@ -2,7 +2,6 @@
 import argparse
 import torch
 import numpy as np
-import matplotlib as mpl
 import matplotlib.pyplot as plt
 from pathlib import Path
 import sys
@@ -10,6 +9,7 @@ import sys
 # Import the format_for_paper function from fem/plots
 sys.path.append('.')  # Ensure the current directory is in the path
 from fem.plots import format_for_paper
+from models.denoiser import KappaDenoiser
 
 # Import the dataloader and noise generator from noisy_kappa_dataset
 from dataprep.noisy_kappa_dataset import (
@@ -18,40 +18,35 @@ from dataprep.noisy_kappa_dataset import (
 )
 
 
-def visualize_augmentations(clean_sample, snr_levels, device, save_path=None):
+def visualize_denoising(clean_sample, snr_levels, denoiser, device, save_path=None):
     """
-    Visualize a clean sample with multiple noise levels.
+    Visualize clean, noisy, and denoised kappa fields.
     
     Parameters:
       clean_sample : Tensor of shape (H, W)
       snr_levels   : List of SNR values in dB to generate noise with
+      denoiser     : Denoiser model
       device       : Torch device
       save_path    : Optional path to save the visualization
     """
     # Apply paper formatting
     format_for_paper()
     
-    # Determine number of plots (clean + noisy variations)
-    n_plots = 1 + len(snr_levels)
-    # fig_width = min(15, 3 * n_plots)
+    # Create figure with 3 columns (clean, noisy, denoised) for each SNR level
+    n_rows = len(snr_levels)
+    fig, axes = plt.subplots(n_rows, 3, figsize=(5, n_rows * 1.5))
     
-    # Create figure
-    # fig, axes = plt.subplots(1, n_plots, figsize=(fig_width, 10))
-    fig, axes = plt.subplots(1, n_plots, figsize=(5, 3))
+    # Handle single row case
+    if n_rows == 1:
+        axes = axes.reshape(1, 3)
     
-    if n_plots == 1:  # Handle single plot case
-        axes = [axes]
+    # Set common colorbar range based on clean sample
+    vmin = clean_sample.min().item()
+    vmax = clean_sample.max().item()
     
-    # Plot clean sample
-    im0 = axes[0].imshow(clean_sample.cpu().numpy(), cmap='viridis')
-    axes[0].set_title(r'Clean $\kappa$ Field', fontsize=8)
-    plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-    axes[0].set_xticks([])
-    axes[0].set_yticks([])
-    
-    # Generate and plot noisy versions using the dataloader's noise generation function
+    # Plot each SNR level
     for i, snr_db in enumerate(snr_levels):
-        # Use a single SNR value for this visualization (min=max=snr_db)
+        # Generate noise for this SNR level
         noise = generate_noise_for_clean_sample(
             clean_sample.unsqueeze(0),  # Add batch dimension
             snr_db_min=snr_db,
@@ -59,13 +54,36 @@ def visualize_augmentations(clean_sample, snr_levels, device, save_path=None):
             device=device
         )
         
+        # Create noisy sample
         noisy_sample = clean_sample + noise.squeeze()
         
-        im = axes[i+1].imshow(noisy_sample.cpu().numpy(), cmap='viridis')
-        axes[i+1].set_title(f'SNR: {snr_db:.1f} dB', fontsize=8)
-        plt.colorbar(im, ax=axes[i+1], fraction=0.046, pad=0.04)
-        axes[i+1].set_xticks([])
-        axes[i+1].set_yticks([])
+        # Get denoised sample
+        with torch.no_grad():
+            denoised_sample = denoiser(noisy_sample.unsqueeze(0).unsqueeze(0)).squeeze()
+        
+        # Plot clean sample (only in first row)
+        if i == 0:
+            im0 = axes[i, 0].imshow(clean_sample.cpu().numpy(), cmap='viridis', vmin=vmin, vmax=vmax)
+            axes[i, 0].set_title(r'Clean $\kappa$', fontsize=8)
+            plt.colorbar(im0, ax=axes[i, 0], fraction=0.046, pad=0.04)
+        else:
+            # Just show clean image without title in other rows
+            im0 = axes[i, 0].imshow(clean_sample.cpu().numpy(), cmap='viridis', vmin=vmin, vmax=vmax)
+            
+        # Plot noisy sample
+        im1 = axes[i, 1].imshow(noisy_sample.cpu().numpy(), cmap='viridis', vmin=vmin, vmax=vmax)
+        axes[i, 1].set_title(f'Noisy ({snr_db:.1f} dB)', fontsize=8)
+        plt.colorbar(im1, ax=axes[i, 1], fraction=0.046, pad=0.04)
+        
+        # Plot denoised sample
+        im2 = axes[i, 2].imshow(denoised_sample.cpu().numpy(), cmap='viridis', vmin=vmin, vmax=vmax)
+        axes[i, 2].set_title('Denoised', fontsize=8)
+        plt.colorbar(im2, ax=axes[i, 2], fraction=0.046, pad=0.04)
+    
+    # Remove axis ticks
+    for ax in axes.flat:
+        ax.set_xticks([])
+        ax.set_yticks([])
     
     plt.tight_layout()
     
@@ -79,12 +97,12 @@ def visualize_augmentations(clean_sample, snr_levels, device, save_path=None):
     plt.show()
 
 
-
-
 def main():
-    parser = argparse.ArgumentParser(description='Visualize Stochastic Noise Augmentation of Kappa Fields')
+    parser = argparse.ArgumentParser(description='Visualize Kappa Field Denoising')
     parser.add_argument('--data_path', type=str, required=True,
                        help='Path to .npy file OR WandB artifact identifier for clean kappa fields')
+    parser.add_argument('--denoiser_path', type=str, default='models/kappa_denoiser_stoch.pt',
+                       help='Path to trained denoiser model')
     parser.add_argument('--reshape_nx', type=int, default=64,
                        help='Reshape dimension in x')
     parser.add_argument('--reshape_ny', type=int, default=64,
@@ -128,8 +146,8 @@ def main():
     dataloader = create_noisy_kappa_dataloader(
         data_path=args.data_path,
         batch_size=1,  # We only need one sample
-        snr_db_min=args.snr_min,  # Not critical since we'll generate our own noise
-        snr_db_max=args.snr_max,  # Not critical since we'll generate our own noise
+        snr_db_min=args.snr_min,
+        snr_db_max=args.snr_max,
         reshape_size=(args.reshape_ny, args.reshape_nx),
         device=args.device,
         is_artifact=args.is_artifact,
@@ -147,19 +165,27 @@ def main():
     sample_idx = min(args.sample_idx, len(clean) - 1)
     clean_sample = clean[sample_idx].squeeze()
     
-    # Generate SNR levels randomly within the specified range
-    snr_levels = np.random.uniform(args.snr_min, args.snr_max, args.snr_steps)
-    snr_levels = np.sort(snr_levels) # Optional: sort for better visualization order
+    # Load denoiser model
+    denoiser = KappaDenoiser()
+    denoiser.load_state_dict(torch.load(args.denoiser_path, map_location=device))
+    denoiser.to(device)
+    denoiser.eval()
     
-    # Visualize the sample with different noise levels
-    visualize_augmentations(clean_sample, snr_levels, device, args.save_path)
+    # Generate SNR levels within the specified range
+    if args.snr_steps > 1:
+        snr_levels = np.linspace(args.snr_min, args.snr_max, args.snr_steps)
+    else:
+        snr_levels = [args.snr_min]
+    
+    # Visualize the denoising capabilities
+    visualize_denoising(clean_sample, snr_levels, denoiser, device, args.save_path)
     
     # If using WandB, log the visualization
     if wandb_run is not None:
         import wandb
-        wandb.log({"augmentation_visualization": wandb.Image(plt.gcf())})
+        wandb.log({"denoising_visualization": wandb.Image(plt.gcf())})
         wandb_run.finish()
 
 
 if __name__ == "__main__":
-    main()
+    main() 
