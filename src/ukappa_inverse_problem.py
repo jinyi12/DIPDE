@@ -627,6 +627,7 @@ def solve_inverse_problem_for_ukappa(
 
     # Return results
     return {
+        "kappa0": kappa0, # initial guess
         "kappa_true": true_kappa, # true kappa
         "kappa_recovered": kappa_recovered, # recovered kappa
         "kappa_final_rel_error": kappa_final_rel_l2_error, # relative L2 error in kappa
@@ -1002,6 +1003,7 @@ def main():
                 "kappa_error": results["kappa_final_rel_error"],
                 "ukappa_error": results["ukappa_recovered_rel_error"],
                 "iterations": results["iterations"],
+                "total_optimization_time": results["total_optimization_time"],
             }
         )
 
@@ -1021,8 +1023,8 @@ def main():
     # --------------------------------------
 
     # Compute and log summary statistics
-    kappa_errors_samples = [r["kappa_final_rel_error"] for r in all_summary_results]
-    ukappa_errors_samples = [r["ukappa_recovered_rel_error"] for r in all_summary_results]
+    kappa_errors_samples = [r["kappa_error"] for r in all_summary_results]
+    ukappa_errors_samples = [r["ukappa_error"] for r in all_summary_results]
     iterations_samples = [r["iterations"] for r in all_summary_results]
     times_samples = [r["total_optimization_time"] for r in all_summary_results]
 

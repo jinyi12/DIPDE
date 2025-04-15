@@ -2,6 +2,7 @@
 import argparse
 import torch
 import numpy as np
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 from pathlib import Path
 import sys
@@ -35,7 +36,7 @@ def visualize_augmentations(clean_sample, snr_levels, device, save_path=None):
     fig_width = min(15, 3 * n_plots)
     
     # Create figure
-    fig, axes = plt.subplots(1, n_plots, figsize=(fig_width, 4))
+    fig, axes = plt.subplots(1, n_plots, figsize=(fig_width, 10))
     
     if n_plots == 1:  # Handle single plot case
         axes = [axes]
@@ -89,7 +90,7 @@ def main():
                        help='Minimum SNR in dB range')
     parser.add_argument('--snr_max', type=float, default=20.0,
                        help='Maximum SNR in dB range')
-    parser.add_argument('--snr_steps', type=int, default=5,
+    parser.add_argument('--snr_steps', type=int, default=3,
                        help='Number of SNR steps to visualize')
     parser.add_argument('--sample_idx', type=int, default=0,
                        help='Index of the sample to visualize')
@@ -143,8 +144,9 @@ def main():
     sample_idx = min(args.sample_idx, len(clean) - 1)
     clean_sample = clean[sample_idx].squeeze()
     
-    # Generate SNR levels at equal intervals from min to max
-    snr_levels = np.linspace(args.snr_min, args.snr_max, args.snr_steps)
+    # Generate SNR levels randomly within the specified range
+    snr_levels = np.random.uniform(args.snr_min, args.snr_max, args.snr_steps)
+    snr_levels = np.sort(snr_levels) # Optional: sort for better visualization order
     
     # Visualize the sample with different noise levels
     visualize_augmentations(clean_sample, snr_levels, device, args.save_path)
