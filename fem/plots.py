@@ -159,8 +159,51 @@ def patch_test():
     l2_err = fem_problem.dx*np.linalg.norm(u_true-u_fem)
     print('l2 error:', l2_err)
 
+def mmse_example():
+    # Set the maximum angle theta (in radians)
+    theta_max = np.pi / 4  # you can change this
+
+    # Create theta values from -theta_max to +theta_max
+    theta = np.linspace(-theta_max, theta_max, 500)
+
+    # Parametrize the unit circle
+    x = np.cos(theta)
+    y = np.sin(theta)
+
+    # Define the function f(theta)
+    f_theta = 1 - theta**2
+
+    # Normalize f(theta) to be used as weights for averaging
+    weights = f_theta / np.trapz(f_theta, theta)  # normalize so the integral is 1
+    
+    # Compute the weighted average of (x, y) under f(theta)
+    avg_x = np.trapz(x * weights, theta)
+    avg_y = np.trapz(y * weights, theta)
+
+    # Plotting
+    plt.figure(figsize=(3.5, 2))
+    plt.gca().set_aspect('equal')
+    sc = plt.scatter(x, y, c=weights, cmap='viridis', s=5)
+    plt.plot([avg_x], [avg_y], 'ro', label='MMSE')
+    plt.plot([1], [0], 'bo', label='MAP')
+    # plt.axis('equal')
+    cbar = plt.colorbar(sc)
+    cbar.set_ticks([])  # removes the ticks entirely
+    plt.legend(loc=1)
+    plt.xlim([0.5, 2.0])
+    plt.ylim([-0.8, 0.8])
+    plt.xticks([])
+    plt.yticks([])
+    # plt.xlabel('x')
+    # plt.ylabel('y')
+    plt.tight_layout()
+    # plt.grid(True)
+    # plt.show()
+    plt.savefig('./figures/mmse_example.jpg', dpi=500)
+
 if __name__ == '__main__':
     np.random.seed(42)
     format_for_paper()
     # test_gradient_1()
-    patch_test()
+    # patch_test()
+    mmse_example()
